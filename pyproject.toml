@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sqlglot-milvus"
+version = "0.1.0"
+description = "MilvusQL: a SQL dialect for Milvus, as a sqlglot plugin"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["sqlglot", "milvus", "sql", "dialect", "vector-search", "pgvector"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]
+
+# Never sqlglot[c] or sqlglot[rs]: the mypyc-compiled builds forbid the runtime subclassing that
+# any third-party dialect is built on. The floor is 30.16.0 because we import sqlglot.parsers.base
+# and rely on the instance-based Parser.expression() signature, neither of which exists earlier;
+# the ceiling is <31 because sqlglot makes breaking parser/generator changes at minor versions.
+dependencies = ["sqlglot>=30.16.0,<31"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.entry-points."sqlglot.dialects"]
+milvus = "sqlglot_milvus.dialect:Milvus"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sqlglot_milvus"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
