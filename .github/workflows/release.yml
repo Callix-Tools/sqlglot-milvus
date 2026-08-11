@@ -51,6 +51,20 @@ jobs:
       - name: Bump versions
         run: task release:bump VERSION=${{ steps.version.outputs.version }}
 
+      - name: Debug GitHub metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "GITHUB_REPOSITORY=$GITHUB_REPOSITORY"
+          git remote -v
+          git config --get remote.origin.url
+
+          curl -fsSL \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY" \
+            | jq '{full_name, private, default_branch}'
+
       # -----------------------------------------------------------------
       # 3. Generate changelog
       # -----------------------------------------------------------------
