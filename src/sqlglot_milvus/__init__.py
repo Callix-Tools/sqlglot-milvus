@@ -30,9 +30,11 @@ if getattr(
 
 from .dialect import Milvus
 from .expressions import (
+    CONSISTENCY_LEVELS,
     METRIC_TYPES,
     AddField,
     BM25Score,
+    ConsistencyLevel,
     CosineDistance,
     HybridSearch,
     InnerProduct,
@@ -47,9 +49,11 @@ from .expressions import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "CONSISTENCY_LEVELS",
     "METRIC_TYPES",
     "AddField",
     "BM25Score",
+    "ConsistencyLevel",
     "CosineDistance",
     "HybridSearch",
     "InnerProduct",

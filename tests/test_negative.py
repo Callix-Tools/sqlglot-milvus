@@ -701,9 +701,9 @@ def test_known_defect_multiword_keyword_fabricates_a_spaced_identifier() -> (
 # ALTER -- operations Milvus cannot perform
 # --------------------------------------------------------------------------------------------
 #
-# The spec (§3.3) is explicit: only ADD FIELD exists; dropping a field, changing a type and
-# changing a vector dimension "must be rejected explicitly and with a clear message, not pretended
-# to have succeeded". None of them currently are. Every case below is a live defect.
+# The spec (§3.3) is explicit: only ADD FIELD (and RENAME) exist; dropping a field, changing a
+# type and changing a vector dimension must be rejected explicitly and with a clear message, not
+# pretended to have succeeded. ALTER_PARSERS overrides DROP/ALTER/MODIFY to do exactly that.
 
 
 def test_alter_add_field_is_structured() -> None:
@@ -722,6 +722,7 @@ def test_alter_add_field_is_structured() -> None:
         "ALTER TABLE items ALTER COLUMN tag TYPE VARCHAR(64)",
         "ALTER TABLE items MODIFY COLUMN tag VARCHAR(64)",
         "ALTER TABLE items ALTER FIELD embedding VECTOR(1024)",
+        "ALTER TABLE items ALTER COLUMN tag SET DEFAULT 1",
     ],
     ids=[
         "drop-field",
@@ -729,59 +730,11 @@ def test_alter_add_field_is_structured() -> None:
         "alter-column-type",
         "modify-column",
         "alter-vector-dim",
+        "alter-set-default",
     ],
-)
-@pytest.mark.xfail(
-    strict=True,
-    reason="DEFECT: unsupported ALTER operations are accepted (spec MILVUSQL §3.3 requires "
-    "explicit rejection). Remove this marker when ALTER_PARSERS rejects them.",
 )
 def test_unsupported_alter_operations_must_be_rejected(sql) -> None:
     assert_rejected(sql)
-
-
-@pytest.mark.parametrize(
-    ("sql", "shape"),
-    [
-        # Structurally valid Alter with an opaque Command buried in its actions: the field name
-        # `tag` is not recoverable from the AST at all.
-        ("ALTER TABLE items DROP FIELD tag", "nested-command"),
-        # Fully structured -- accepted as if Milvus could drop columns.
-        ("ALTER TABLE items DROP COLUMN tag", "structured"),
-        # Top-level Command: opaque, and round-trips byte-identically.
-        ("ALTER TABLE items MODIFY COLUMN tag VARCHAR(64)", "command"),
-        ("ALTER TABLE items ALTER FIELD embedding VECTOR(1024)", "command"),
-    ],
-    ids=["drop-field", "drop-column", "modify-column", "alter-vector-dim"],
-)
-def test_known_defect_unsupported_alter_operations_are_silently_accepted(
-    sql, shape
-) -> None:
-    # Pins the exact failure mode of each, so the xfail above has a documented "what happens now".
-    ast = parse(sql)
-    if shape == "command":
-        assert isinstance(ast, exp.Command)
-        assert ast.sql(dialect="milvus") == sql
-    elif shape == "nested-command":
-        assert isinstance(ast, exp.Alter)
-        assert [i.name for i in ast.find_all(exp.Identifier)] == [
-            "items"
-        ]  # `tag` is gone
-        assert list(ast.find_all(exp.Command))
-    else:
-        assert isinstance(ast, exp.Alter)
-        assert not list(ast.find_all(exp.Command))
-
-
-def test_known_defect_alter_column_type_is_accepted_and_rewritten() -> None:
-    # Worse than the others: not only accepted, but silently respelled. Text in != text out, with
-    # no error at either end.
-    ast = parse("ALTER TABLE items ALTER COLUMN tag TYPE VARCHAR(64)")
-    assert isinstance(ast, exp.Alter)
-    assert (
-        ast.sql(dialect="milvus")
-        == "ALTER TABLE items ALTER COLUMN tag SET DATA TYPE VARCHAR(64)"
-    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -789,49 +742,17 @@ def test_known_defect_alter_column_type_is_accepted_and_rewritten() -> None:
 # --------------------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="DEFECT: `WEIGHT` with no number is consumed and dropped. Remove this marker when "
-    "_parse_search_arm requires an operand after WEIGHT.",
-)
 def test_weight_without_a_number_must_be_rejected() -> None:
     assert_rejected(
         "SELECT id FROM items HYBRID SEARCH (e <=> :d WEIGHT) LIMIT 10"
     )
 
 
-def test_known_defect_weight_without_a_number_is_silently_dropped() -> None:
-    # _match_text_seq eats WEIGHT, _parse_number returns None, and `weight` is an optional arg --
-    # so the keyword evaporates and the query means something different on the way out.
-    ast = parse(
-        "SELECT id FROM items HYBRID SEARCH (e <=> :d WEIGHT) LIMIT 10"
-    )
-    assert next(ast.find_all(SearchArm)).args.get("weight") is None
-    assert (
-        ast.sql(dialect="milvus")
-        == "SELECT id FROM items HYBRID SEARCH (e <=> :d) LIMIT 10"
-    )
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="DEFECT: `LOAD <name>` (no TABLE, no DATA) degrades to an opaque exp.Command. Remove "
-    "this marker when _parse_milvus_load rejects it.",
-)
-def test_load_without_table_or_data_must_be_rejected() -> None:
-    assert_rejected("LOAD items")
-
-
 @pytest.mark.parametrize(
     "sql", ["LOAD items", "LOAD"], ids=["load-name", "load-bare"]
 )
-def test_known_defect_load_without_table_degrades_to_command(sql) -> None:
-    # Inherited from sqlglot's _parse_load fallback, which our override retreats into. The only
-    # trace is a logger.warning that no normal logging config surfaces -- and the Command
-    # round-trips byte-identically, so nothing downstream can tell either.
-    ast = parse(sql)
-    assert isinstance(ast, exp.Command)
-    assert ast.sql(dialect="milvus") == sql
+def test_load_without_table_or_data_must_be_rejected(sql) -> None:
+    assert_rejected(sql)
 
 
 def test_known_defect_release_without_table_becomes_an_aliased_expression() -> (
@@ -849,20 +770,8 @@ def test_known_defect_release_without_table_becomes_an_aliased_expression() -> (
     assert ast.sql(dialect="milvus") == "RELEASE AS items"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="DEFECT: a dangling `USING` with no index method is consumed and dropped. Remove this "
-    "marker when _parse_index_params requires a method name after USING.",
-)
 def test_create_index_with_a_dangling_using_must_be_rejected() -> None:
     assert_rejected("CREATE INDEX i ON items (embedding) USING")
-
-
-def test_known_defect_create_index_drops_a_dangling_using() -> None:
-    # _parse_var(any_token=True) returns None at EOF but the USING token is already consumed, so
-    # the trailing-token check never fires and the clause vanishes.
-    ast = parse("CREATE INDEX i ON items (embedding) USING")
-    assert ast.sql(dialect="milvus") == "CREATE INDEX i ON items (embedding)"
 
 
 def test_union_search_params_binds_to_the_same_node_as_the_union_limit() -> (

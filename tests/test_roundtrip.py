@@ -203,12 +203,6 @@ def test_create_table(sql) -> None:
     assert_golden(sql, exp.Create)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ARRAY<T>(n) from spec 2.1 misparses: the (n) is taken as a call, yielding a ColumnDef "
-    "whose kind is Cast(Array([8]) AS ARRAY<INT>). It regenerates as "
-    "'CREATE TABLE t (a CAST(ARRAY(8) AS ARRAY<INT>))', which then fails to re-parse.",
-)
 def test_create_table_array_with_capacity() -> None:
     assert_golden("CREATE TABLE t (a ARRAY<INT>(8))", exp.Create)
 
@@ -368,18 +362,12 @@ def test_insert(sql) -> None:
         pytest.param("DELETE FROM items WHERE category IS NULL", id="is_null"),
         pytest.param(
             "DELETE FROM items WHERE (category = :cat OR category IS NULL) AND id > 1"
-            " AND NOT id BETWEEN 5 AND 9",
+            " AND id NOT BETWEEN 5 AND 9",
             id="compound_with_parentheses",
         ),
-    ],
-)
-def test_delete(sql) -> None:
-    assert_golden(sql, exp.Delete)
-
-
-@pytest.mark.parametrize(
-    "sql",
-    [
+        # IS NOT / NOT IN / NOT BETWEEN: exp.Not(exp.Is/In/Between) has no infix spelling in the
+        # base Generator -- not even in postgres or mysql, which MilvusQL otherwise borrows its
+        # operators from -- so Milvus.Generator.not_sql renders these three infix by hand.
         pytest.param(
             "DELETE FROM items WHERE category IS NOT NULL", id="is_not_null"
         ),
@@ -389,13 +377,7 @@ def test_delete(sql) -> None:
         ),
     ],
 )
-@pytest.mark.xfail(
-    strict=True,
-    reason="Negated predicates lose their infix spelling: the bare Dialect generator renders "
-    "exp.Not(exp.Is/In/Between) as a prefix 'NOT x IS NULL' / 'NOT x IN (...)'. Semantically "
-    "equivalent and AST-stable, but not text-identical. Postgres overrides this; Milvus does not.",
-)
-def test_delete_negated_predicates(sql) -> None:
+def test_delete(sql) -> None:
     assert_golden(sql, exp.Delete)
 
 
@@ -596,17 +578,14 @@ def test_hybrid_search(sql) -> None:
     assert_golden(sql, exp.Select)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="SEARCH PARAMS written before OFFSET is silently reordered to 'OFFSET ... SEARCH "
-    "PARAMS ...': after_limit_modifiers appends it last. _validate_clause_order checks position "
-    "against LIMIT only, never OFFSET.",
-)
-def test_search_params_before_offset() -> None:
-    assert_golden(
-        "SELECT id FROM items LIMIT 10 SEARCH PARAMS (ef_search=64) OFFSET 5",
-        exp.Select,
-    )
+def test_search_params_before_offset_is_rejected() -> None:
+    # SEARCH PARAMS must follow the whole LIMIT/OFFSET family, not just LIMIT: canonical order is
+    # "search_params_after_limit_offset" above (LIMIT ... OFFSET ... SEARCH PARAMS).
+    with pytest.raises(sqlglot.ParseError, match="SEARCH PARAMS must follow LIMIT"):
+        sqlglot.parse_one(
+            "SELECT id FROM items LIMIT 10 SEARCH PARAMS (ef_search=64) OFFSET 5",
+            read="milvus",
+        )
 
 
 # ------------------------------------------------------------------------------------------

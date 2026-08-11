@@ -128,6 +128,23 @@ class HybridSearch(exp.Expression):
     arg_types = {"expressions": True, "rerank": False}
 
 
+class ConsistencyLevel(exp.Expression):
+    """``CONSISTENCY LEVEL Bounded`` -- how fresh a read this query is willing to accept.
+
+    Milvus has no transaction isolation levels; it has *read* consistency levels, which answer the
+    same question ("how stale may the data I see be?") with a different set of values. The RFC
+    settles the query-level/connection-level question in favour of supporting both, with the query
+    level winning, so the language needs a clause for it.
+    """
+
+    arg_types = {"this": True}
+
+
+#: The consistency levels Milvus defines. Track B validates against this; the parser deliberately
+#: does not, so that a server-side addition does not require a new release of this package.
+CONSISTENCY_LEVELS = ("STRONG", "BOUNDED", "SESSION", "EVENTUALLY")
+
+
 # -----------------------------------------------------------------------------
 # Functions
 # -----------------------------------------------------------------------------
@@ -149,21 +166,29 @@ HYBRID_ARG = "hybrid"
 #: ``args`` key holding a :class:`SearchParams`.
 SEARCH_PARAMS_ARG = "search_params"
 
-exp.Select.arg_types[HYBRID_ARG] = False
-exp.Select.arg_types[SEARCH_PARAMS_ARG] = False
+#: ``args`` key holding a :class:`ConsistencyLevel`.
+CONSISTENCY_ARG = "consistency_level"
 
-exp.Subquery.arg_types[HYBRID_ARG] = False
-exp.Subquery.arg_types[SEARCH_PARAMS_ARG] = False
-exp.SetOperation.arg_types[HYBRID_ARG] = False
-exp.SetOperation.arg_types[SEARCH_PARAMS_ARG] = False
+#: Every node our clauses can attach to. ``Subquery`` and ``SetOperation`` are in sqlglot's
+#: ``MODIFIABLES``, so a parenthesised or unioned query accepts the clauses too; declaring the args
+#: on all three keeps ``validate_expression`` quiet and keeps the clause visible to consumers that
+#: read ``args`` directly.
+_MODIFIER_HOSTS = (exp.Select, exp.Subquery, exp.SetOperation)
+
+for _host in _MODIFIER_HOSTS:
+    for _arg in (HYBRID_ARG, SEARCH_PARAMS_ARG, CONSISTENCY_ARG):
+        _host.arg_types[_arg] = False
 
 
 __all__ = [
+    "CONSISTENCY_ARG",
+    "CONSISTENCY_LEVELS",
     "HYBRID_ARG",
     "METRIC_TYPES",
     "SEARCH_PARAMS_ARG",
     "AddField",
     "BM25Score",
+    "ConsistencyLevel",
     "CosineDistance",
     "HybridSearch",
     "InnerProduct",

@@ -37,11 +37,15 @@ TT_SEARCH_PARAMS = TokenType.PROPERTIES
 #: adds it back to ``ID_VAR_TOKENS``/``TABLE_ALIAS_TOKENS`` so it stays usable as an identifier.
 TT_RELEASE = TokenType.SOUNDS_LIKE
 
+#: ``CONSISTENCY LEVEL`` -- multi-word, so ``consistency`` and ``level`` stay identifiers.
+TT_CONSISTENCY_LEVEL = TokenType.ORDERED
+
 #: Number of ``TokenType`` members in the sqlglot release this dialect was written against.
 EXPECTED_TOKEN_TYPE_COUNT = 443
 
 __all__ = [
     "EXPECTED_TOKEN_TYPE_COUNT",
+    "TT_CONSISTENCY_LEVEL",
     "TT_HYBRID_SEARCH",
     "TT_INNER_PRODUCT",
     "TT_L1",

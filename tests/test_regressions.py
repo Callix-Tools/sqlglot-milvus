@@ -49,6 +49,7 @@ from sqlglot_milvus import (
 )
 from sqlglot_milvus._tokens import (
     EXPECTED_TOKEN_TYPE_COUNT,
+    TT_CONSISTENCY_LEVEL,
     TT_HYBRID_SEARCH,
     TT_INNER_PRODUCT,
     TT_L1,
@@ -65,6 +66,7 @@ RECYCLED = {
     TT_HYBRID_SEARCH,
     TT_SEARCH_PARAMS,
     TT_RELEASE,
+    TT_CONSISTENCY_LEVEL,
 }
 
 
@@ -268,6 +270,7 @@ def test_token_type_member_count_is_pinned() -> None:
         ("LANGUAGE", TT_HYBRID_SEARCH),
         ("PROPERTIES", TT_SEARCH_PARAMS),
         ("SOUNDS_LIKE", TT_RELEASE),
+        ("ORDERED", TT_CONSISTENCY_LEVEL),
     ],
 )
 def test_recycled_members_still_exist_under_the_expected_names(
@@ -278,8 +281,8 @@ def test_recycled_members_still_exist_under_the_expected_names(
     assert getattr(TokenType, name, None) is alias
 
 
-def test_recycled_members_are_five_distinct_members() -> None:
-    assert len(RECYCLED) == 5
+def test_recycled_members_are_six_distinct_members() -> None:
+    assert len(RECYCLED) == 6
     assert not RECYCLED & {
         TokenType.LIMIT,
         TokenType.NULLSAFE_EQ,
@@ -369,9 +372,7 @@ def test_only_nullsafe_eq_was_removed_from_equality() -> None:
         ("SELECT a FROM t WHERE a > 1", exp.GT),
         ("SELECT a FROM t WHERE a >= 1", exp.GTE),
         ("SELECT a FROM t WHERE a IS NULL", exp.Is),
-        ("SELECT a FROM t WHERE a IS NOT NULL", exp.Not),
         ("SELECT a FROM t WHERE a IN (1, 2)", exp.In),
-        ("SELECT a FROM t WHERE NOT a IN (1, 2)", exp.Not),
         ("SELECT a FROM t WHERE a LIKE '%x%'", exp.Like),
         ("SELECT a FROM t WHERE a ILIKE '%x%'", exp.ILike),
         (
@@ -386,6 +387,29 @@ def test_only_nullsafe_eq_was_removed_from_equality() -> None:
 def test_every_other_comparison_operator_survived(sql, node) -> None:
     assert behaviour(sql, "milvus") == behaviour(sql, None)
     assert isinstance(parse(sql).args["where"].this, node)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT a FROM t WHERE a IS NOT NULL",
+        "SELECT a FROM t WHERE a NOT IN (1, 2)",
+        "SELECT a FROM t WHERE a NOT BETWEEN 1 AND 2",
+    ],
+    ids=["is_not_null", "not_in", "not_between"],
+)
+def test_negated_predicates_render_infix_not_prefix(sql) -> None:
+    # A deliberate divergence from the base Generator (Milvus.Generator.not_sql): both dialects
+    # parse `sql` to the identical exp.Not(exp.Is/In/Between) AST -- we did not touch parsing --
+    # but milvus re-emits it infix ("a IS NOT NULL") where the base dialect emits a leading NOT
+    # ("NOT a IS NULL"). Assert the AST is unchanged and only the rendering differs, so this stays
+    # a documented choice rather than a silent drift.
+    milvus_ast = parse(sql)
+    base_ast = sqlglot.parse_one(sql, error_level=ErrorLevel.RAISE)
+    assert isinstance(milvus_ast.args["where"].this, exp.Not)
+    assert repr(milvus_ast) == repr(base_ast)
+    assert milvus_ast.sql(dialect="milvus") == sql
+    assert base_ast.sql() != sql
 
 
 def test_nullsafe_eq_is_cosine_distance_here() -> None:
@@ -528,6 +552,7 @@ def test_query_modifier_tokens_is_keyed_only_on_token_types_we_own() -> None:
     ) == {
         TT_HYBRID_SEARCH,
         TT_SEARCH_PARAMS,
+        TT_CONSISTENCY_LEVEL,
     }
 
 
@@ -801,19 +826,17 @@ def test_hybrid_search_is_emitted_where_it_was_written(sql) -> None:
     assert_stable(sql, exp.Select)
 
 
-def test_clause_order_strictness_is_one_sided() -> None:
-    """What is left of FINDING 4: SEARCH PARAMS is emitted after OFFSET regardless of where it was
-    written, because ``after_limit_modifiers`` appends it last and the validator only compares our
-    clauses against LIMIT, never OFFSET. Accepted and reordered -- the AST is right, only the text
-    moves. Pinned rather than fixed: OFFSET is not part of D5's stated ordering."""
-    sql = "SELECT id FROM items LIMIT 10 SEARCH PARAMS (ef=1) OFFSET 5"
-    emitted = "SELECT id FROM items LIMIT 10 OFFSET 5 SEARCH PARAMS (ef=1)"
-    assert parse(sql).sql("milvus") == emitted
-    assert (
-        parse(emitted).sql("milvus") == emitted
-    )  # the rewritten form is a fixed point
-    # repr() would differ purely because args are keyed in parse order, so compare per-clause.
-    assert _clauses(parse(sql)) == _clauses(parse(emitted))
+def test_clause_order_strictness_covers_offset() -> None:
+    """FINDING 4, fixed: SEARCH PARAMS must follow the whole LIMIT/OFFSET family, not just LIMIT.
+    ``_validate_clause_order`` compares against ``earliest_limit``/``latest_limit`` across both
+    "limit" and "offset" keys, so writing SEARCH PARAMS between them is rejected like every other
+    D5 violation instead of being silently reordered on the way out."""
+    non_canonical = "SELECT id FROM items LIMIT 10 SEARCH PARAMS (ef=1) OFFSET 5"
+    canonical = "SELECT id FROM items LIMIT 10 OFFSET 5 SEARCH PARAMS (ef=1)"
+    with pytest.raises(ParseError, match="SEARCH PARAMS must follow LIMIT"):
+        parse(non_canonical)
+    ast = assert_stable(canonical, exp.Select)
+    assert {"limit", "offset", SEARCH_PARAMS_ARG} <= set(_clauses(ast))
 
 
 @pytest.mark.parametrize(
@@ -1247,12 +1270,12 @@ def test_statements_can_be_parsed_in_a_single_script() -> None:
     [
         "ALTER TABLE items ADD COLUMN tag VARCHAR(32)",
         "ALTER TABLE items ADD CONSTRAINT c UNIQUE (a)",
-        "ALTER TABLE items DROP COLUMN a",
         "ALTER TABLE items RENAME TO x",
-        "ALTER TABLE t ALTER COLUMN a SET DEFAULT 1",
     ],
 )
 def test_alter_parsers_override_still_delegates(sql) -> None:
-    # ALTER_PARSERS["ADD"] is replaced wholesale; everything that is not `ADD FIELD` must reach
-    # the base implementation unchanged.
+    # ALTER_PARSERS["ADD"] only special-cases `FIELD`; every other ADD action, and RENAME (which
+    # ALTER_PARSERS never touches at all), must reach the base implementation unchanged. DROP,
+    # ALTER and MODIFY are the ones deliberately *not* delegated -- see test_negative.py's
+    # test_unsupported_alter_operations_must_be_rejected.
     assert behaviour(sql, "milvus") == behaviour(sql, None)

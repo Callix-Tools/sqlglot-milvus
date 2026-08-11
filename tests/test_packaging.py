@@ -322,6 +322,7 @@ CUSTOM_NODES = {
         "this": exp.column("text"),
         "expression": exp.var("q"),
     },
+    expressions.ConsistencyLevel: lambda: {"this": exp.var("Bounded")},
 }
 
 _NODE_IDS = [cls.__name__ for cls in CUSTOM_NODES]

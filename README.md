@@ -48,11 +48,20 @@ pip install sqlglot-milvus
 | Vector search | `SELECT id FROM items WHERE category = :cat ORDER BY embedding <-> :q LIMIT 10 SEARCH PARAMS (ef_search=64)` |
 | Hybrid search | `SELECT id FROM items HYBRID SEARCH (embedding <=> :dv WEIGHT 0.7, sparse_emb <#> :sv WEIGHT 0.3) RERANK RRF(k=60) LIMIT 10` |
 | Full-text | `SELECT id FROM items WHERE MATCH(text) AGAINST (:q) ORDER BY BM25_SCORE(text, :q) DESC LIMIT 10` |
+| Consistency level | `SELECT id FROM items ORDER BY embedding <-> :q LIMIT 10 CONSISTENCY LEVEL Bounded` |
 | Add field | `ALTER TABLE items ADD FIELD tag VARCHAR(32)` |
 
 The entity is called `TABLE`, not `COLLECTION`. On the SQL surface that is the ordinary SQL word,
 so `CREATE TABLE` / `DROP TABLE` parse for free; "collection" remains the term one level down, in
 the `pymilvus` calls the AST is translated into.
+
+Full grammar, including the constructs above, canonical clause ordering and every documented
+tradeoff, is in [`docs/MILVUSQL_SPEC.md`](docs/MILVUSQL_SPEC.md).
+
+`ADD FIELD` and `RENAME TO` are the only supported `ALTER TABLE` actions. Milvus cannot change a
+field's type, change a vector's dimension or drop a field, so `DROP`/`ALTER COLUMN ... TYPE`/
+`MODIFY` are rejected with a `ParseError` explaining that the collection needs recreating — never
+silently accepted or degraded into an opaque, unreadable node.
 
 ### Distance operators
 
@@ -79,8 +88,10 @@ in generated MilvusQL can never be bound** — see the rewrite step under *Migra
 
 ### Clause order is strict
 
-`SEARCH PARAMS` must follow `LIMIT`; `HYBRID SEARCH` must precede it. Non-canonical order is a
-`ParseError`, not a silent reordering:
+Canonical order is `HYBRID SEARCH ... LIMIT [OFFSET] SEARCH PARAMS ... CONSISTENCY LEVEL ...`.
+`HYBRID SEARCH` must precede `LIMIT`/`OFFSET`; `SEARCH PARAMS` and `CONSISTENCY LEVEL` must follow
+them; `SEARCH PARAMS` must precede `CONSISTENCY LEVEL`. Non-canonical order is a `ParseError`, not a
+silent reordering:
 
 ```
 SELECT id FROM items SEARCH PARAMS (ef=64) LIMIT 10
@@ -88,7 +99,8 @@ SELECT id FROM items SEARCH PARAMS (ef=64) LIMIT 10
 ```
 
 sqlglot's modifier loop has no positional state and would otherwise accept the above and emit it
-back reordered — accepted input, different output text.
+back reordered — accepted input, different output text. The rule applies inside a parenthesized
+subquery or a `UNION` branch too, not only at the top of a statement.
 
 ## Migrating from pgvector
 
@@ -128,14 +140,24 @@ rewriting.
 
 ## Reserved words
 
-`RELEASE`, `HYBRID SEARCH` and `SEARCH PARAMS` are the only additions to sqlglot's base keyword
-set. `HYBRID SEARCH` and `SEARCH PARAMS` are registered as *multi-word* keywords, so `hybrid`,
-`search` and `params` all remain usable as ordinary identifiers, aliases and placeholders. `RELEASE`
-is single-word and therefore genuinely reserved by the tokenizer, but the parser adds it back
-everywhere identifiers are accepted — `SELECT release FROM t` works.
+`RELEASE`, `HYBRID SEARCH`, `SEARCH PARAMS` and `CONSISTENCY LEVEL` are the only additions to
+sqlglot's base keyword set. The three multi-word ones are registered as *pairs*, so `hybrid`,
+`search`, `params`, `consistency` and `level` all remain usable as ordinary identifiers, aliases and
+placeholders. `RELEASE` is single-word and therefore genuinely reserved by the tokenizer, but the
+parser adds it back everywhere identifiers are accepted — `SELECT release FROM t` works.
 
 Known casualty: a table literally named `search` with an alias `params` (`FROM search params`) is
 lexed as the `SEARCH PARAMS` keyword. Quote it (`FROM "search" params`) to recover.
+
+## Only generate with `dialect="milvus"`
+
+`ast.sql()` and `ast.sql(dialect="postgres")` on a query that carries `HYBRID SEARCH` or
+`SEARCH PARAMS` **silently drop the clause** and return a syntactically valid, semantically wrong
+full-table-scan query — with no error, not even under `unsupported_level=ErrorLevel.RAISE`. This
+is not a bug we can fix from this package: those clauses live as extra keys on `Select.args`, and a
+foreign `Generator` (postgres's, the default one) simply never looks at keys it doesn't know about,
+so there is no unknown node to raise on — the modifier is just never visited. Track B (and any other
+caller) must always pass `dialect="milvus"` explicitly when calling `.sql()`.
 
 ## Development
 

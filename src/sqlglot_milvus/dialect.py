@@ -11,6 +11,7 @@ from sqlglot.parsers.base import BaseParser
 from sqlglot.tokens import TokenType
 
 from ._tokens import (
+    TT_CONSISTENCY_LEVEL,
     TT_HYBRID_SEARCH,
     TT_INNER_PRODUCT,
     TT_L1,
@@ -18,10 +19,12 @@ from ._tokens import (
     TT_SEARCH_PARAMS,
 )
 from .expressions import (
+    CONSISTENCY_ARG,
     HYBRID_ARG,
     SEARCH_PARAMS_ARG,
     AddField,
     BM25Score,
+    ConsistencyLevel,
     CosineDistance,
     HybridSearch,
     InnerProduct,
@@ -56,6 +59,35 @@ _UNSUPPORTED_INDEX_ARGS = (
     "tablespace",
     "on",
 )
+
+
+def _rewrite_array_capacity(node: exp.Expr | None) -> exp.Expr | None:
+    """Reinterpret ``ARRAY<T>(n)`` as a capacity, not a cast.
+
+    The base grammar already claims ``TYPE<...>(v1, v2, ...)`` as shorthand for
+    ``CAST(ARRAY(v1, v2, ...) AS TYPE<...>)`` -- ``_parse_types``'s branch for the closing ``>``
+    immediately followed by ``(`` or ``[`` (``parser.py``, right after the nested-type ``LT``
+    match). MilvusQL has no array-literal-cast syntax of its own, and the spec's ``ARRAY<T>(n)``
+    has exactly that shape: one integer, immediately after the element type. Reusing sqlglot's own
+    fixed-size-array ``values`` slot (the same one ``INT[3]`` populates) rather than inventing a
+    new arg keeps every other type consumer -- the optimizer, ``find_all``, a foreign generator --
+    working unchanged; only ``datatype_sql`` needs to know the capacity renders in parens here
+    instead of brackets.
+    """
+    if (
+        isinstance(node, exp.Cast)
+        and isinstance(node.this, exp.Array)
+        and len(node.this.expressions) == 1
+        and isinstance(node.this.expressions[0], exp.Literal)
+        and node.this.expressions[0].is_int
+        and isinstance(node.to, exp.DataType)
+        and node.to.is_type(exp.DataType.Type.ARRAY)
+    ):
+        capacity = node.this.expressions[0]
+        data_type = node.to.copy()
+        data_type.set("values", [capacity])
+        return data_type
+    return node
 
 
 def _null_safe_eq_unsupported(
@@ -151,6 +183,7 @@ class Milvus(Dialect):
             # clause opener is a single token that no alias rule will swallow.
             "HYBRID SEARCH": TT_HYBRID_SEARCH,
             "SEARCH PARAMS": TT_SEARCH_PARAMS,
+            "CONSISTENCY LEVEL": TT_CONSISTENCY_LEVEL,
             # Necessarily single-word, so genuinely reserved here; the parser un-reserves it.
             "RELEASE": TT_RELEASE,
         }
@@ -236,13 +269,25 @@ class Milvus(Dialect):
                     SEARCH_PARAMS_ARG,
                     self._parse_search_params(),
                 ),
+                TT_CONSISTENCY_LEVEL: lambda self: (
+                    CONSISTENCY_ARG,
+                    self._parse_consistency_level(),
+                ),
             }.items()
         }
         QUERY_MODIFIER_TOKENS = set(QUERY_MODIFIER_PARSERS)
 
+        # Milvus can add a field to a live collection and rename one, and that is the whole list.
+        # Changing a field's type, changing a vector's dimension and dropping a field are not
+        # supported by the engine at all, so accepting them here -- which the inherited parsers do,
+        # turning ALTER COLUMN tag TYPE VARCHAR(64) into a SET DATA TYPE that reads as if something
+        # happened -- would promise the user an operation that can never run.
         ALTER_PARSERS = {
             **BaseParser.ALTER_PARSERS,
             "ADD": lambda self: self._parse_milvus_alter_add(),
+            "DROP": lambda self: self._reject_alter("DROP"),
+            "ALTER": lambda self: self._reject_alter("ALTER"),
+            "MODIFY": lambda self: self._reject_alter("MODIFY"),
         }
 
         # ---------------------------------------------------------------------------------
@@ -253,6 +298,13 @@ class Milvus(Dialect):
             """``LOAD TABLE x [WITH (...)]``, falling through to ``LOAD DATA ...``."""
             index = self._index
             if not self._match(TokenType.TABLE):
+                # Anything that is not LOAD TABLE and not LOAD DATA would otherwise be swallowed
+                # by the inherited fallback into an opaque exp.Command that round-trips perfectly
+                # while meaning nothing -- the exact failure mode the D12 contract exists to catch.
+                # DATA is matched by text, not a TokenType (see the base _parse_load), so we do
+                # the same here rather than inventing a check the base parser doesn't have either.
+                if self._curr is None or self._curr.text.upper() != "DATA":
+                    self.raise_error("Expected TABLE or DATA after LOAD")
                 self._retreat(index)
                 return super()._parse_load()
             this = self._parse_table_parts()
@@ -286,6 +338,16 @@ class Milvus(Dialect):
                 )
             return self._parse_alter_table_add()
 
+        def _parse_types(self, *args, **kwargs):
+            return _rewrite_array_capacity(super()._parse_types(*args, **kwargs))
+
+        def _reject_alter(self, action: str):
+            self.raise_error(
+                f"Milvus cannot {action} a field: only ADD FIELD and RENAME are supported. "
+                "Changing a field's type, changing a vector's dimension and dropping a field "
+                "require recreating the collection."
+            )
+
         # ---------------------------------------------------------------------------------
         # Search clauses
         # ---------------------------------------------------------------------------------
@@ -295,6 +357,17 @@ class Milvus(Dialect):
             return self.expression(
                 SearchParams(expressions=self._parse_wrapped_properties())
             )
+
+        def _parse_consistency_level(self):
+            self._advance()
+            # A bare word rather than a quoted string: the levels are an enum, not free text, and
+            # `CONSISTENCY LEVEL Bounded` reads the way the rest of the language does. Any word is
+            # accepted -- validating the set belongs to Track B, which talks to a specific server
+            # version and can say what that version actually supports.
+            level = self._parse_var(any_token=True)
+            if level is None:
+                self.raise_error("CONSISTENCY LEVEL expects a level name")
+            return self.expression(ConsistencyLevel(this=level))
 
         def _parse_hybrid_search(self):
             self._advance()
@@ -336,12 +409,10 @@ class Milvus(Dialect):
             weight = None
             if self._match_text_seq("WEIGHT"):
                 weight = self._parse_number()
-                if weight is None and not self._match_set(
-                    _ARM_TERMINATORS, advance=False
-                ):
-                    # `WEIGHT -0.3` otherwise reports a bare "Expecting )" pointing at the minus,
-                    # naming neither WEIGHT nor the reason. A WEIGHT with *nothing* after it is a
-                    # separate, pinned defect and is deliberately left to that report.
+                if weight is None:
+                    # Covers both `WEIGHT -0.3` (which otherwise reported a bare "Expecting )"
+                    # pointing at the minus) and `WEIGHT` followed by a comma or the closing paren
+                    # (which was silently dropped, leaving an unweighted arm the user never wrote).
                     self.raise_error("WEIGHT expects a number")
             return self.expression(SearchArm(this=this, weight=weight))
 
@@ -362,11 +433,14 @@ class Milvus(Dialect):
                 return super()._parse_index_params()
 
             columns = self._parse_wrapped_csv(self._parse_with_operator)
-            using = (
-                self._parse_var(any_token=True)
-                if self._match(TokenType.USING)
-                else None
-            )
+            using = None
+            if self._match(TokenType.USING):
+                using = self._parse_var(any_token=True)
+                if using is None:
+                    # A dangling USING was consumed and dropped, so `... (embedding) USING` built
+                    # an index with no method at all and regenerated as if USING had never been
+                    # typed.
+                    self.raise_error("USING expects an index method")
             with_storage = (
                 self._match(TokenType.WITH)
                 and self._parse_wrapped_properties()
@@ -412,8 +486,14 @@ class Milvus(Dialect):
 
             ``positions`` is whatever :func:`_recording_modifier` collected for *this* query, so
             "the LIMIT clause" here means the clause and never a column, alias or placeholder that
-            happens to be spelled ``limit``. Both ``LIMIT n`` and ``FETCH FIRST n ROWS ONLY`` fill
-            the same ``limit`` slot and are therefore recorded under the same key.
+            happens to be spelled ``limit``. ``LIMIT n`` and ``FETCH FIRST n ROWS ONLY`` fill the
+            same ``limit`` slot; ``OFFSET`` is recorded separately, so the canonical
+            ``LIMIT ... OFFSET ...`` pair is treated as one family with two possible positions --
+            HYBRID SEARCH must precede the earlier of the two, SEARCH PARAMS and CONSISTENCY LEVEL
+            must follow the later.
+
+            Canonical order: ``HYBRID SEARCH ... LIMIT ... OFFSET ... SEARCH PARAMS ...
+            CONSISTENCY LEVEL``.
             """
             first: dict[str, tuple[int, t.Any]] = {}
             for key, index, token in positions:
@@ -421,15 +501,30 @@ class Milvus(Dialect):
 
             hybrid = first.get(HYBRID_ARG)
             params = first.get(SEARCH_PARAMS_ARG)
-            limit = first.get("limit")
+            consistency = first.get(CONSISTENCY_ARG)
+            limit_family = [p for p in (first.get("limit"), first.get("offset")) if p]
+            earliest_limit = min(limit_family, default=None, key=lambda p: p[0])
+            latest_limit = max(limit_family, default=None, key=lambda p: p[0])
 
-            if hybrid and limit and hybrid[0] > limit[0]:
+            if hybrid and earliest_limit and hybrid[0] > earliest_limit[0]:
                 self.raise_error("HYBRID SEARCH must precede LIMIT", hybrid[1])
-            if params and limit and params[0] < limit[0]:
+            if params and latest_limit and params[0] < latest_limit[0]:
                 self.raise_error("SEARCH PARAMS must follow LIMIT", params[1])
+            if consistency and latest_limit and consistency[0] < latest_limit[0]:
+                self.raise_error(
+                    "CONSISTENCY LEVEL must follow LIMIT", consistency[1]
+                )
             if hybrid and params and hybrid[0] > params[0]:
                 self.raise_error(
                     "HYBRID SEARCH must precede SEARCH PARAMS", hybrid[1]
+                )
+            if hybrid and consistency and hybrid[0] > consistency[0]:
+                self.raise_error(
+                    "HYBRID SEARCH must precede CONSISTENCY LEVEL", hybrid[1]
+                )
+            if params and consistency and params[0] > consistency[0]:
+                self.raise_error(
+                    "SEARCH PARAMS must precede CONSISTENCY LEVEL", params[1]
                 )
 
     class Generator(generator.Generator):
@@ -482,6 +577,9 @@ class Milvus(Dialect):
                 if (body := self.expressions(e, flat=True))
                 else ""
             ),
+            ConsistencyLevel: lambda self, e: (
+                f"{self.seg('CONSISTENCY LEVEL')} {self.sql(e, 'this')}"
+            ),
         }
 
         def offset_limit_modifiers(self, expression, fetch, limit):
@@ -498,6 +596,7 @@ class Milvus(Dialect):
             return [
                 *super().after_limit_modifiers(expression),
                 self.sql(expression, SEARCH_PARAMS_ARG),
+                self.sql(expression, CONSISTENCY_ARG),
             ]
 
         def ordered_sql(self, e: exp.Ordered) -> str:
@@ -511,6 +610,56 @@ class Milvus(Dialect):
                 e = e.copy()
                 e.set("nulls_first", False)
             return super().ordered_sql(e)
+
+        def not_sql(self, e: exp.Not) -> str:
+            """Render ``IS NOT`` / ``NOT IN`` / ``NOT BETWEEN`` infix, not as a ``NOT (...)`` prefix.
+
+            The base generator has no infix path for these: ``exp.Not(exp.Is/In/Between)`` comes
+            out prefixed in every shipped dialect, including postgres and mysql, which MilvusQL
+            otherwise borrows its operator spellings from. ``exp.Is`` already carries a ``negate``
+            flag for exactly this case; ``In`` and ``Between`` do not, so those two are rendered by
+            hand, mirroring the base ``in_sql`` / ``between_sql`` bodies with ``NOT`` spliced in.
+            A ``BETWEEN SYMMETRIC`` falls back to the inherited prefix form: negating its
+            OR-expanded rendering (``SUPPORTS_BETWEEN_FLAGS`` defaults to ``False``) is not a
+            matter of inserting one word, and MilvusQL has no SYMMETRIC syntax to round-trip
+            regardless.
+            """
+            this = e.this
+            if isinstance(this, exp.Is):
+                return self.is_sql(
+                    exp.Is(this=this.this, expression=this.expression, negate=True)
+                )
+            if isinstance(this, exp.In):
+                query = this.args.get("query")
+                unnest = this.args.get("unnest")
+                field = this.args.get("field")
+                is_global = " GLOBAL" if this.args.get("is_global") else ""
+                if query:
+                    in_sql = self.sql(query)
+                elif unnest:
+                    in_sql = self.in_unnest_op(unnest)
+                elif field:
+                    in_sql = self.sql(field)
+                else:
+                    in_sql = f"({self.expressions(this, dynamic=True, new_line=True, skip_first=True, skip_last=True)})"
+                return f"{self.sql(this, 'this')}{is_global} NOT IN {in_sql}"
+            if isinstance(this, exp.Between) and not this.args.get("symmetric"):
+                return (
+                    f"{self.sql(this, 'this')} NOT BETWEEN "
+                    f"{self.sql(this, 'low')} AND {self.sql(this, 'high')}"
+                )
+            return super().not_sql(e)
+
+        def datatype_sql(self, e: exp.DataType) -> str:
+            # ARRAY<T>(n): the capacity renders in parens, matching the spec's own spelling. The
+            # base rendering of a nested type's `values` arg uses brackets for ARRAY -- correct for
+            # the unrelated `INT[3]` fixed-size-array spelling, wrong for ours.
+            if e.is_type(exp.DataType.Type.ARRAY) and e.args.get("values"):
+                capacity = self.expressions(e, key="values", flat=True)
+                without_capacity = e.copy()
+                without_capacity.set("values", None)
+                return f"{super().datatype_sql(without_capacity)}({capacity})"
+            return super().datatype_sql(e)
 
         def matchagainst_sql(self, e: exp.MatchAgainst) -> str:
             # Identical to the base rendering except for the space before "(", which the MilvusQL
