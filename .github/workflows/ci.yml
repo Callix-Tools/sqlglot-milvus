@@ -1,0 +1,87 @@
+name: "CI"
+
+on:
+  pull_request:
+    branches: ["*"]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "ruff.toml"
+      - "ty.toml"
+      - ".github/workflows/ci-core.yml"
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: task install
+
+      - name: Lint
+        run: task lint CI=true
+
+  tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - uses: arduino/setup-task@v2
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: task install
+
+      - name: Test
+        run: task tests CONCURRENCY=4 COVERAGE=true
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/coverage.xml
+          flags: core
+          fail_ci_if_error: true
+
+      - name: Upload test analytics to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: reports/junit.xml
+          flags: core
+          report_type: test_results
+          fail_ci_if_error: true
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: core-test-results
+          path: reports/

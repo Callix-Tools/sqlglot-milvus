@@ -76,19 +76,23 @@ def _run_cold(script: str, *args: str) -> dict:
 # ------------------------------------------------------------------------------------------
 
 
-def test_dialect_resolves_to_exactly_one_class_object():
+def test_dialect_resolves_to_exactly_one_class_object() -> None:
     # `_Dialect.__eq__` makes `Milvus == "milvus"` true by *name*, so equality proves nothing
     # here: a duplicate registration (stale reload, or the entry point loading a second copy of
     # the module) yields two distinct classes that still compare equal, while transforms
     # registered on one of them never fire. Identity is the only assertion that catches it.
     assert Dialect.get(DIALECT) is Milvus
-    assert sqlglot_milvus.Milvus is Milvus, "__init__ must re-export the class, not a copy"
+    assert sqlglot_milvus.Milvus is Milvus, (
+        "__init__ must re-export the class, not a copy"
+    )
 
     # get_or_raise returns an *instance*, not the class (ground truth §5.7).
     assert type(Dialect.get_or_raise(DIALECT)) is Milvus
 
 
-def test_nested_parser_and_generator_are_not_shared_with_the_base_dialect():
+def test_nested_parser_and_generator_are_not_shared_with_the_base_dialect() -> (
+    None
+):
     # Omitting the nested `class Parser` / `class Generator` sets parser_class/generator_class to
     # the *parent's own class object* -- no subclass is synthesized -- and every mutation we make
     # would then land on sqlglot's shared BaseParser/Generator process-wide (§5.2).
@@ -127,15 +131,19 @@ print(json.dumps(result))
 """
 
 
-def test_entry_point_resolves_without_importing_the_package_first():
+def test_entry_point_resolves_without_importing_the_package_first() -> None:
     # The interesting case is the one this session can never reproduce: conftest.py imports
     # sqlglot_milvus, so in-process the metaclass has already registered "milvus" and the
     # entry-point loader is never even consulted.
     result = _run_cold(_COLD_ENTRY_POINT_SCRIPT)
 
     assert result["preimported"] is False
-    assert result["loaded_lazily"] is True, "read='milvus' did not pull the package in"
-    assert result["same_class"] is True, "entry point loaded a different class object"
+    assert result["loaded_lazily"] is True, (
+        "read='milvus' did not pull the package in"
+    )
+    assert result["same_class"] is True, (
+        "entry point loaded a different class object"
+    )
     assert result["registered_module"] == "sqlglot_milvus.dialect"
 
     # A dialect that failed to load does not error: sqlglot degrades the statement to exp.Command,
@@ -169,7 +177,7 @@ PINNED_HOSTS = {
 LIVE_HOSTS = {alias: getattr(_tokens, alias) for alias in PINNED_HOSTS}
 
 
-def test_token_type_member_count_is_pinned():
+def test_token_type_member_count_is_pinned() -> None:
     actual = len(list(TokenType))
     assert actual == _tokens.EXPECTED_TOKEN_TYPE_COUNT, (
         f"sqlglot {sqlglot.__version__} exposes {actual} TokenType members; this dialect was "
@@ -183,18 +191,22 @@ def test_token_type_member_count_is_pinned():
     )
 
 
-def test_recycled_aliases_match_the_pinned_hosts():
-    assert {alias: member.name for alias, member in LIVE_HOSTS.items()} == PINNED_HOSTS
+def test_recycled_aliases_match_the_pinned_hosts() -> None:
+    assert {
+        alias: member.name for alias, member in LIVE_HOSTS.items()
+    } == PINNED_HOSTS
 
 
-def test_recycled_aliases_are_pairwise_distinct():
+def test_recycled_aliases_are_pairwise_distinct() -> None:
     # A copy-paste making two aliases the same member would not raise anywhere: the later entry
     # would just win in FACTOR/KEYWORDS and one operator would quietly parse as the other.
     assert len(set(LIVE_HOSTS.values())) == len(LIVE_HOSTS)
 
 
-@pytest.mark.parametrize("alias", sorted(PINNED_HOSTS), ids=sorted(PINNED_HOSTS))
-def test_recycled_host_is_still_unclaimed_by_sqlglot(alias):
+@pytest.mark.parametrize(
+    "alias", sorted(PINNED_HOSTS), ids=sorted(PINNED_HOSTS)
+)
+def test_recycled_host_is_still_unclaimed_by_sqlglot(alias) -> None:
     """The count pin catches renumbering; this catches *repurposing*.
 
     We derive from the bare `Dialect`, so only the base tokenizer and `BaseParser` can collide
@@ -203,10 +215,21 @@ def test_recycled_host_is_still_unclaimed_by_sqlglot(alias):
     MilvusQL clause opener.
     """
     member = LIVE_HOSTS[alias]
-    claimed_by = [kw for kw, tt in sqlglot.tokens.Tokenizer.KEYWORDS.items() if tt is member]
-    assert claimed_by == [], f"base tokenizer now maps {claimed_by} to {member}"
+    claimed_by = [
+        kw
+        for kw, tt in sqlglot.tokens.Tokenizer.KEYWORDS.items()
+        if tt is member
+    ]
+    assert claimed_by == [], (
+        f"base tokenizer now maps {claimed_by} to {member}"
+    )
 
-    for registry in ("STATEMENT_PARSERS", "QUERY_MODIFIER_PARSERS", "FACTOR", "EQUALITY"):
+    for registry in (
+        "STATEMENT_PARSERS",
+        "QUERY_MODIFIER_PARSERS",
+        "FACTOR",
+        "EQUALITY",
+    ):
         assert member not in getattr(BaseParser, registry), (
             f"BaseParser.{registry} now attaches meaning to {member}"
         )
@@ -217,7 +240,7 @@ def test_recycled_host_is_still_unclaimed_by_sqlglot(alias):
 # ------------------------------------------------------------------------------------------
 
 
-def test_select_arg_types_carry_the_milvus_modifier_keys():
+def test_select_arg_types_carry_the_milvus_modifier_keys() -> None:
     # `Expression.error_messages` raises TypeError -- not ParseError -- for an arg key missing
     # from arg_types, but only when sqlglot's UNITTEST flag is set, i.e. exactly under pytest.
     # So a regression of the import-time patch in expressions.py cannot be reproduced in
@@ -231,19 +254,37 @@ def test_select_arg_types_carry_the_milvus_modifier_keys():
     assert SEARCH_PARAMS_ARG not in exp.Select.required_args
 
 
-def test_select_arg_type_keys_are_the_documented_strings():
+@pytest.mark.parametrize(
+    "node", [exp.Subquery, exp.SetOperation], ids=["subquery", "set-operation"]
+)
+@pytest.mark.parametrize(
+    "key", [HYBRID_ARG, SEARCH_PARAMS_ARG], ids=["hybrid", "search-params"]
+)
+def test_subquery_and_set_operation_carry_the_keys_too(node, key) -> None:
+    # BaseParser.MODIFIABLES is (Query, Table, TableFromRows, Values), so a query modifier attaches
+    # to a Subquery or a SetOperation exactly as it does to a Select. `Expression.set` writes an
+    # undeclared key anyway, so patching only Select did not keep the clause off those nodes -- it
+    # only made `key in node.arg_types` lie about it, and `unnest().sql()` drop it.
+    assert node.arg_types.get(key) is False
+    assert key not in node.required_args
+
+
+def test_select_arg_type_keys_are_the_documented_strings() -> None:
     # The generator addresses these args through the constants, but the AST is a public contract
     # (Track B reads `select.args["search_params"]`), so the *strings* are what must not drift.
     assert (HYBRID_ARG, SEARCH_PARAMS_ARG) == ("hybrid", "search_params")
 
 
-def test_select_validates_with_the_milvus_modifiers_attached():
+def test_select_validates_with_the_milvus_modifiers_attached() -> None:
     # The direct reproduction of the failure mode above: unpatched, this raises
     # TypeError: Unexpected keyword: 'search_params' for <class '...Select'>
     arm = expressions.SearchArm(this=exp.column("embedding"))
     select = exp.select("id").from_("items")
     select.set(HYBRID_ARG, expressions.HybridSearch(expressions=[arm]))
-    select.set(SEARCH_PARAMS_ARG, expressions.SearchParams(expressions=[exp.var("ef_search")]))
+    select.set(
+        SEARCH_PARAMS_ARG,
+        expressions.SearchParams(expressions=[exp.var("ef_search")]),
+    )
     assert select.error_messages() == []
 
 
@@ -259,8 +300,14 @@ CUSTOM_NODES = {
     expressions.LoadTable: lambda: {"this": exp.to_table("items")},
     expressions.ReleaseTable: lambda: {"this": exp.to_table("items")},
     expressions.AddField: lambda: {"this": exp.column("tag")},
-    expressions.InnerProduct: lambda: {"this": exp.column("embedding"), "expression": exp.var("q")},
-    expressions.L1Distance: lambda: {"this": exp.column("embedding"), "expression": exp.var("q")},
+    expressions.InnerProduct: lambda: {
+        "this": exp.column("embedding"),
+        "expression": exp.var("q"),
+    },
+    expressions.L1Distance: lambda: {
+        "this": exp.column("embedding"),
+        "expression": exp.var("q"),
+    },
     expressions.CosineDistance: lambda: {
         "this": exp.column("embedding"),
         "expression": exp.var("q"),
@@ -271,13 +318,16 @@ CUSTOM_NODES = {
     expressions.HybridSearch: lambda: {
         "expressions": [expressions.SearchArm(this=exp.column("embedding"))]
     },
-    expressions.BM25Score: lambda: {"this": exp.column("text"), "expression": exp.var("q")},
+    expressions.BM25Score: lambda: {
+        "this": exp.column("text"),
+        "expression": exp.var("q"),
+    },
 }
 
 _NODE_IDS = [cls.__name__ for cls in CUSTOM_NODES]
 
 
-def test_every_custom_node_is_covered_by_this_file():
+def test_every_custom_node_is_covered_by_this_file() -> None:
     # Without this, adding a node and forgetting a CUSTOM_NODES entry is a silent gap.
     declared = {
         obj
@@ -289,18 +339,26 @@ def test_every_custom_node_is_covered_by_this_file():
     assert declared == set(CUSTOM_NODES)
 
 
-@pytest.mark.parametrize(("cls", "make_kwargs"), CUSTOM_NODES.items(), ids=_NODE_IDS)
-def test_custom_node_constructs_with_its_required_args(cls, make_kwargs):
+@pytest.mark.parametrize(
+    ("cls", "make_kwargs"), CUSTOM_NODES.items(), ids=_NODE_IDS
+)
+def test_custom_node_constructs_with_its_required_args(
+    cls, make_kwargs
+) -> None:
     node = cls(**make_kwargs())
     assert node.error_messages() == []
 
     # `required_args` is what actually gates parsing, and the `Expr` docstring upstream claims
     # arg_types values mean "optional" -- they mean *required*. Pin the real semantics.
-    assert cls.required_args == {k for k, required in cls.arg_types.items() if required}
+    assert cls.required_args == {
+        k for k, required in cls.arg_types.items() if required
+    }
 
 
-@pytest.mark.parametrize(("cls", "make_kwargs"), CUSTOM_NODES.items(), ids=_NODE_IDS)
-def test_custom_node_rejects_missing_required_args(cls, make_kwargs):
+@pytest.mark.parametrize(
+    ("cls", "make_kwargs"), CUSTOM_NODES.items(), ids=_NODE_IDS
+)
+def test_custom_node_rejects_missing_required_args(cls, make_kwargs) -> None:
     empty = cls()
 
     # Constructing never validates -- only Parser.expression() does -- so check both halves:
@@ -310,7 +368,9 @@ def test_custom_node_rejects_missing_required_args(cls, make_kwargs):
     for key in cls.required_args:
         assert f"'{key}'" in reported
 
-    parser = Dialect.get_or_raise(DIALECT).parser(error_level=ErrorLevel.IMMEDIATE)
+    parser = Dialect.get_or_raise(DIALECT).parser(
+        error_level=ErrorLevel.IMMEDIATE
+    )
     with pytest.raises(ParseError, match="Required keyword"):
         parser.expression(empty)
 
@@ -350,16 +410,18 @@ print(json.dumps(result))
 """
 
 
-def test_sqlglotc_flag_still_exists_upstream():
+def test_sqlglotc_flag_still_exists_upstream() -> None:
     # The guard reads the flag with a getattr default, so a rename upstream turns it into dead
     # code that can never fire -- and the failure it exists to prevent (TypeError: interpreted
     # classes cannot inherit from compiled, thrown from deep inside sqlglot on the first parse)
     # comes back. Nothing else in the suite would notice.
     assert hasattr(sqlglot.tokens, "SQLGLOTC_INSTALLED")
-    assert sqlglot.tokens.SQLGLOTC_INSTALLED is False, "pure-Python sqlglot is required"
+    assert sqlglot.tokens.SQLGLOTC_INSTALLED is False, (
+        "pure-Python sqlglot is required"
+    )
 
 
-def test_import_succeeds_when_sqlglotc_is_absent():
+def test_import_succeeds_when_sqlglotc_is_absent() -> None:
     # Control for the test below: same script, same interpreter, flag untouched. Without it, an
     # ImportError caused by a broken sys.path would read as the guard working.
     result = _run_cold(_SQLGLOTC_GUARD_SCRIPT, "pretend-pure-python")
@@ -367,7 +429,7 @@ def test_import_succeeds_when_sqlglotc_is_absent():
     assert result["raised"] is None, result["message"]
 
 
-def test_import_fails_loudly_when_sqlglotc_is_installed():
+def test_import_fails_loudly_when_sqlglotc_is_installed() -> None:
     result = _run_cold(_SQLGLOTC_GUARD_SCRIPT, "pretend-compiled")
 
     assert result["flag"] is True
@@ -378,7 +440,8 @@ def test_import_fails_loudly_when_sqlglotc_is_installed():
     message = result["message"]
     assert "sqlglot[c]" in message
     # Remediation, not just a diagnosis -- the whole point of failing at import time.
-    assert "pip uninstall" in message and "pip install" in message
+    assert "pip uninstall" in message
+    assert "pip install" in message
 
 
 # ------------------------------------------------------------------------------------------
@@ -386,21 +449,25 @@ def test_import_fails_loudly_when_sqlglotc_is_installed():
 # ------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", sqlglot_milvus.__all__, ids=list(sqlglot_milvus.__all__))
-def test_all_export_resolves(name):
-    assert hasattr(sqlglot_milvus, name), f"__all__ advertises {name!r} but nothing binds it"
+@pytest.mark.parametrize(
+    "name", sqlglot_milvus.__all__, ids=list(sqlglot_milvus.__all__)
+)
+def test_all_export_resolves(name) -> None:
+    assert hasattr(sqlglot_milvus, name), (
+        f"__all__ advertises {name!r} but nothing binds it"
+    )
 
 
-def test_all_has_no_duplicates():
+def test_all_has_no_duplicates() -> None:
     assert len(sqlglot_milvus.__all__) == len(set(sqlglot_milvus.__all__))
 
 
-def test_version_matches_pyproject(repo_root):
+def test_version_matches_pyproject(repo_root) -> None:
     pyproject = _load_pyproject(repo_root / "pyproject.toml")
     assert sqlglot_milvus.__version__ == pyproject["project"]["version"]
 
 
-def test_version_matches_installed_distribution_metadata():
+def test_version_matches_installed_distribution_metadata() -> None:
     # Diverges when pyproject.toml is bumped without reinstalling; the wheel then ships one
     # version while `sqlglot_milvus.__version__` reports another.
     assert version("sqlglot-milvus") == sqlglot_milvus.__version__
@@ -413,13 +480,15 @@ def test_version_matches_installed_distribution_metadata():
 
 def _load_pyproject(path: pathlib.Path) -> dict:
     try:
-        import tomllib
+        import tomllib  # noqa: PLC0415
     except ModuleNotFoundError:  # Python < 3.11
-        tomllib = pytest.importorskip("tomli", reason="no TOML reader available")
+        tomllib = pytest.importorskip(
+            "tomli", reason="no TOML reader available"
+        )
     return tomllib.loads(path.read_text(encoding="utf-8"))
 
 
-def test_pyproject_declares_a_lowercase_milvus_entry_point(repo_root):
+def test_pyproject_declares_a_lowercase_milvus_entry_point(repo_root) -> None:
     pyproject = _load_pyproject(repo_root / "pyproject.toml")
     group = pyproject["project"]["entry-points"][PLUGIN_GROUP]
 
@@ -430,17 +499,17 @@ def test_pyproject_declares_a_lowercase_milvus_entry_point(repo_root):
     assert group[DIALECT] == "sqlglot_milvus.dialect:Milvus"
 
 
-def test_pyproject_entry_point_target_resolves_to_our_class(repo_root):
+def test_pyproject_entry_point_target_resolves_to_our_class(repo_root) -> None:
     pyproject = _load_pyproject(repo_root / "pyproject.toml")
-    module_path, _, attr = pyproject["project"]["entry-points"][PLUGIN_GROUP][DIALECT].partition(
-        ":"
-    )
+    module_path, _, attr = pyproject["project"]["entry-points"][PLUGIN_GROUP][
+        DIALECT
+    ].partition(":")
     # A dangling `:DoesNotExist` escapes sqlglot's loader as a raw AttributeError (only
     # ImportError is caught), and a module-only target fails silently as "Unknown dialect".
     assert getattr(importlib.import_module(module_path), attr) is Milvus
 
 
-def test_entry_point_name_matches_the_lowercased_class_name():
+def test_entry_point_name_matches_the_lowercased_class_name() -> None:
     # `_Dialect.__hash__` is hash(cls.__name__.lower()) while `__eq__` compares by name. If the
     # entry-point name and the class name ever diverge, `Milvus == "<ep name>"` stays True while
     # the hashes differ, and anything using a dialect as a dict key breaks in a very quiet way.
@@ -449,7 +518,7 @@ def test_entry_point_name_matches_the_lowercased_class_name():
     assert hash(Milvus) == hash(DIALECT)
 
 
-def test_installed_entry_point_is_lowercase_milvus():
+def test_installed_entry_point_is_lowercase_milvus() -> None:
     # The installed metadata, not pyproject.toml -- these diverge when the source is edited
     # without reinstalling, and it is the metadata that sqlglot's loader actually reads. This
     # also keeps item 7's guarantee alive on interpreters where the TOML tests above skip.

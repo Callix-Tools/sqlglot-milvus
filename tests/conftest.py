@@ -18,7 +18,7 @@ from sqlglot.tokens import TokenType
 # runs at class-definition time. Without this, registration would depend on whichever test module
 # happened to import first -- or on the entry point, which is exactly what tests/test_packaging.py
 # exercises in a *cold* interpreter and must therefore not be pre-empted here.
-import sqlglot_milvus  # noqa: F401
+import sqlglot_milvus
 
 #: The dialect name every test passes to `read=` / `write=`. `get_or_raise` does not lowercase,
 #: so the string is case-sensitive (see docs/SQLGLOT_API_GROUND_TRUTH.md §5.7).

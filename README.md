@@ -67,9 +67,15 @@ Spelled exactly as pgvector spells them, so a pgvector query needs no rewriting:
 
 ### Bind parameters
 
-Named only: `:name`. Vectors travel as bind parameters and are **never** interpolated into the
-query text — a 768-float embedding is tens of kilobytes of SQL, and round-tripping the numbers
-through text risks precision loss.
+MilvusQL is written with named parameters: `:name`. Vectors travel as bind parameters and are
+**never** interpolated into the query text — a 768-float embedding is tens of kilobytes of SQL, and
+round-tripping the numbers through text risks precision loss.
+
+`:name` is the only spelling the language defines, but it is not the only one the *parser* accepts:
+sqlglot's anonymous `?` (`exp.Placeholder` with no name) and `@name` (`exp.Parameter`) both parse
+and are re-emitted verbatim, because refusing them would make several `read="postgres"` migrations
+unparseable one hop before anyone would look. Track B's cursor uses `paramstyle="named"`, so **a `?`
+in generated MilvusQL can never be bound** — see the rewrite step under *Migrating from pgvector*.
 
 ### Clause order is strict
 
@@ -88,9 +94,23 @@ back reordered — accepted input, different output text.
 
 ```python
 sqlglot.transpile(
+    "SELECT id FROM items ORDER BY embedding <-> %(q)s LIMIT 5",
+    read="postgres", write="milvus",
+)
+# ['SELECT id FROM items ORDER BY embedding <-> :q LIMIT 5']
+```
+
+Use psycopg's **`pyformat`** (`%(name)s`) source queries where you can: those carry a name and land
+directly on MilvusQL's `:name`. The positional `format` style (`%s`) transpiles to `?`, which is
+valid syntax and permanently unbindable under `paramstyle="named"` — give each parameter a name
+before or after the transpile:
+
+```python
+sqlglot.transpile(
     "SELECT id FROM items ORDER BY embedding <-> %s LIMIT 5",
     read="postgres", write="milvus",
 )
+# ['SELECT id FROM items ORDER BY embedding <-> ? LIMIT 5']   <- rewrite the ? to :q
 ```
 
 `CREATE INDEX` is accepted in **both** word orders — MilvusQL's `ON items (embedding) USING HNSW`

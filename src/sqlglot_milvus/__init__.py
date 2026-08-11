@@ -16,17 +16,20 @@ from sqlglot import tokens as _tokens
 # so this package imports perfectly cleanly, and then the first parse_one() raises
 # "TypeError: interpreted classes cannot inherit from compiled" from deep inside sqlglot. Fail here
 # instead, with instructions. Upstream documents the limitation in the wheel's own METADATA.
-if getattr(_tokens, "SQLGLOTC_INSTALLED", False):  # pragma: no cover - env-dependent
-    raise ImportError(
+if getattr(
+    _tokens, "SQLGLOTC_INSTALLED", False
+):  # pragma: no cover - env-dependent
+    msg = (
         "sqlglot-milvus is incompatible with sqlglot[c] / sqlglot[rs]: the mypyc-compiled build "
         "forbids runtime subclassing of Parser/Generator/Expression, which every third-party "
         "dialect requires. Install the pure-Python build instead:\n"
         "    pip uninstall -y sqlglotc\n"
         "    pip install --force-reinstall 'sqlglot>=30.16.0,<31'"
     )
+    raise ImportError(msg)
 
-from .dialect import Milvus  # noqa: E402
-from .expressions import (  # noqa: E402
+from .dialect import Milvus
+from .expressions import (
     METRIC_TYPES,
     AddField,
     BM25Score,
@@ -44,6 +47,7 @@ from .expressions import (  # noqa: E402
 __version__ = "0.1.0"
 
 __all__ = [
+    "METRIC_TYPES",
     "AddField",
     "BM25Score",
     "CosineDistance",
@@ -51,7 +55,6 @@ __all__ = [
     "InnerProduct",
     "L1Distance",
     "LoadTable",
-    "METRIC_TYPES",
     "Milvus",
     "ReleaseTable",
     "Rerank",

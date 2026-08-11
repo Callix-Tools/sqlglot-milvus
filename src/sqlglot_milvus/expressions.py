@@ -17,9 +17,9 @@ from __future__ import annotations
 
 from sqlglot import exp
 
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Statements
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 class LoadTable(exp.Expression):
@@ -39,14 +39,18 @@ class AddField(exp.Expression):
 
     Milvus supports adding a field but not dropping one or changing a type, so this is
     deliberately the only ``ALTER`` action MilvusQL models structurally.
+
+    ``exists`` carries ``IF NOT EXISTS``, which ``ADD COLUMN`` accepts and this therefore has to
+    accept too; leaving it out did not reject the spelling, it fed the three words to the column
+    parser and lost the field name inside a ``CASE`` expression.
     """
 
-    arg_types = {"this": True}
+    arg_types = {"this": True, "exists": False}
 
 
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Distance operators
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 #
 # Spelled exactly as pgvector spells them, so that a pgvector query transpiles to MilvusQL
 # unchanged. ``<->`` reuses sqlglot's built-in ``exp.Distance`` (the base tokenizer already emits
@@ -80,9 +84,9 @@ METRIC_TYPES = {
 }
 
 
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Search clauses
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 class SearchParams(exp.Expression):
@@ -124,23 +128,22 @@ class HybridSearch(exp.Expression):
     arg_types = {"expressions": True, "rerank": False}
 
 
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Functions
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 class BM25Score(exp.Expression, exp.Func):
     """``BM25_SCORE(text, :q)`` -- full-text relevance score."""
 
-    _sql_names = ["BM25_SCORE"]
-    arg_types = {"this": True, "expression": True}
+    _sql_names = ["BM25_SCORE"]  # noqa: RUF012
+    arg_types = {"this": True, "expression": True}  # noqa: RUF012
 
 
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Select modifiers
-# --------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
-#: ``args`` key holding a :class:`HybridSearch`.
 HYBRID_ARG = "hybrid"
 
 #: ``args`` key holding a :class:`SearchParams`.
@@ -149,20 +152,25 @@ SEARCH_PARAMS_ARG = "search_params"
 exp.Select.arg_types[HYBRID_ARG] = False
 exp.Select.arg_types[SEARCH_PARAMS_ARG] = False
 
+exp.Subquery.arg_types[HYBRID_ARG] = False
+exp.Subquery.arg_types[SEARCH_PARAMS_ARG] = False
+exp.SetOperation.arg_types[HYBRID_ARG] = False
+exp.SetOperation.arg_types[SEARCH_PARAMS_ARG] = False
+
 
 __all__ = [
+    "HYBRID_ARG",
+    "METRIC_TYPES",
+    "SEARCH_PARAMS_ARG",
     "AddField",
     "BM25Score",
     "CosineDistance",
     "HybridSearch",
-    "HYBRID_ARG",
     "InnerProduct",
     "L1Distance",
     "LoadTable",
-    "METRIC_TYPES",
     "ReleaseTable",
     "Rerank",
     "SearchArm",
     "SearchParams",
-    "SEARCH_PARAMS_ARG",
 ]

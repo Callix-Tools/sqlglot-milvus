@@ -93,12 +93,12 @@ def _py(node: exp.Expression) -> t.Any:
     return node.to_py()
 
 
-def _props(properties: t.Iterable[exp.Expression]) -> t.Dict[str, t.Any]:
+def _props(properties: t.Iterable[exp.Expression]) -> dict[str, t.Any]:
     """``[Property(Var(k), Literal(v)), ...]`` -> ``{"k": v}``."""
     return {p.name: _py(p.args["value"]) for p in properties}
 
 
-def _weight(node: t.Optional[exp.Expression]) -> t.Optional[float]:
+def _weight(node: exp.Expression | None) -> float | None:
     """A hybrid arm's WEIGHT as a float.
 
     ``Literal.to_py()`` returns an ``int`` for an integral literal but a ``decimal.Decimal`` for a
@@ -109,7 +109,7 @@ def _weight(node: t.Optional[exp.Expression]) -> t.Optional[float]:
     return None if node is None else float(node.to_py())
 
 
-def _distance_parts(node: exp.Binary) -> t.Dict[str, t.Any]:
+def _distance_parts(node: exp.Binary) -> dict[str, t.Any]:
     """``(column, metric_type, placeholder)`` for one distance expression.
 
     Operand order is deliberately *not* assumed: ``:q <-> embedding`` is legal MilvusQL and parses
@@ -127,7 +127,7 @@ def _distance_parts(node: exp.Binary) -> t.Dict[str, t.Any]:
     }
 
 
-def ann_search_plan(select: exp.Select) -> t.Dict[str, t.Any]:
+def ann_search_plan(select: exp.Select) -> dict[str, t.Any]:
     """Everything ``pymilvus`` ``Collection.search()`` needs, taken from the AST alone."""
     # A vector search has exactly one ORDER BY key. The parser does not enforce that (see
     # test_parser_accepts_a_mixed_order_by), so the unpack is where a translator would notice.
@@ -144,11 +144,13 @@ def ann_search_plan(select: exp.Select) -> t.Dict[str, t.Any]:
         **_distance_parts(ordered.this),
         "limit": limit.expression.to_py() if limit else None,
         "offset": offset.expression.to_py() if offset else None,
-        "search_params": _props(search_params.expressions) if search_params else {},
+        "search_params": _props(search_params.expressions)
+        if search_params
+        else {},
     }
 
 
-def hybrid_search_plan(select: exp.Select) -> t.Dict[str, t.Any]:
+def hybrid_search_plan(select: exp.Select) -> dict[str, t.Any]:
     """Everything ``pymilvus`` ``Collection.hybrid_search()`` needs."""
     hybrid = select.args[HYBRID_ARG]
     rerank = hybrid.args.get("rerank")
@@ -162,12 +164,14 @@ def hybrid_search_plan(select: exp.Select) -> t.Dict[str, t.Any]:
             for arm in hybrid.expressions
         ],
         "rerank": rerank.name if rerank else None,
-        "rerank_params": _props(rerank.args.get("expressions") or []) if rerank else {},
+        "rerank_params": _props(rerank.args.get("expressions") or [])
+        if rerank
+        else {},
         "limit": select.args["limit"].expression.to_py(),
     }
 
 
-def create_table_plan(create: exp.Create) -> t.Dict[str, t.Any]:
+def create_table_plan(create: exp.Create) -> dict[str, t.Any]:
     """Everything ``pymilvus`` ``CollectionSchema``/``FieldSchema`` needs."""
     schema = create.this
     fields = []
@@ -193,7 +197,7 @@ def create_table_plan(create: exp.Create) -> t.Dict[str, t.Any]:
     }
 
 
-def create_index_plan(create: exp.Create) -> t.Dict[str, t.Any]:
+def create_index_plan(create: exp.Create) -> dict[str, t.Any]:
     """Everything ``pymilvus`` ``Collection.create_index()`` needs."""
     index = create.this
     params = index.args["params"]
@@ -214,7 +218,7 @@ def create_index_plan(create: exp.Create) -> t.Dict[str, t.Any]:
 # ------------------------------------------------------------------------------------------------
 
 
-def test_placeholder_node_class_and_name_attribute():
+def test_placeholder_node_class_and_name_attribute() -> None:
     """The single most load-bearing fact in this file, spelled out for Track B.
 
     ``:emb`` -> ``exp.Placeholder``; the name lives in ``args["this"]`` as a **plain ``str``**, not
@@ -289,8 +293,10 @@ PLACEHOLDER_POSITIONS = [
 ]
 
 
-@pytest.mark.parametrize("sql,locate,name", PLACEHOLDER_POSITIONS)
-def test_placeholder_is_a_bind_parameter_in_every_position(sql, locate, name):
+@pytest.mark.parametrize(("sql", "locate", "name"), PLACEHOLDER_POSITIONS)
+def test_placeholder_is_a_bind_parameter_in_every_position(
+    sql, locate, name
+) -> None:
     node = locate(_parse(sql))
 
     assert isinstance(node, exp.Placeholder), f"got {type(node).__name__}"
@@ -298,16 +304,18 @@ def test_placeholder_is_a_bind_parameter_in_every_position(sql, locate, name):
 
 
 @pytest.mark.parametrize(
-    "sql,names",
+    ("sql", "names"),
     [
         pytest.param(ANN_SEARCH, {"cat", "q"}, id="ann-search"),
         pytest.param(HYBRID_SEARCH, {"dv", "sv"}, id="hybrid-search"),
         pytest.param(FULL_TEXT_SEARCH, {"q"}, id="full-text-search"),
         pytest.param(INSERT, {"emb", "cat"}, id="insert"),
-        pytest.param("DELETE FROM items WHERE category = :cat", {"cat"}, id="delete"),
+        pytest.param(
+            "DELETE FROM items WHERE category = :cat", {"cat"}, id="delete"
+        ),
     ],
 )
-def test_every_bind_parameter_is_reachable_by_find_all(sql, names):
+def test_every_bind_parameter_is_reachable_by_find_all(sql, names) -> None:
     """``find_all`` is how Track B collects the parameter set for a statement.
 
     ``find_all`` walks breadth-first, so the *order* of the results is not source order -- compare
@@ -317,10 +325,10 @@ def test_every_bind_parameter_is_reachable_by_find_all(sql, names):
 
     assert {p.name for p in ast.find_all(exp.Placeholder)} == names
     # The whole point: no bind parameter was inlined into the tree as a literal or an identifier.
-    assert not any(l.this in names for l in ast.find_all(exp.Literal))
+    assert not any(l.this in names for l in ast.find_all(exp.Literal))  # noqa: E741
 
 
-def test_vector_parameter_never_degrades_to_text():
+def test_vector_parameter_never_degrades_to_text() -> None:
     """The core architectural invariant, stated negatively.
 
     If ``:q`` ever parsed as anything but a Placeholder -- a Column named "q", a string literal, an
@@ -347,9 +355,15 @@ DISTANCE_OPERATORS = [
 ]
 
 
-@pytest.mark.parametrize("operator,node_type,metric", DISTANCE_OPERATORS)
-def test_distance_operator_maps_to_node_and_metric(operator, node_type, metric):
-    ast = _parse(f"SELECT id FROM items ORDER BY embedding {operator} :q LIMIT 3")
+@pytest.mark.parametrize(
+    ("operator", "node_type", "metric"), DISTANCE_OPERATORS
+)
+def test_distance_operator_maps_to_node_and_metric(
+    operator, node_type, metric
+) -> None:
+    ast = _parse(
+        f"SELECT id FROM items ORDER BY embedding {operator} :q LIMIT 3"
+    )
     distance = ast.args["order"].expressions[0].this
 
     assert type(distance) is node_type
@@ -360,10 +374,16 @@ def test_distance_operator_maps_to_node_and_metric(operator, node_type, metric):
     assert distance.expression.name == "q"
 
 
-@pytest.mark.parametrize("operator,node_type,metric", DISTANCE_OPERATORS)
-def test_distance_operator_inside_hybrid_arm(operator, node_type, metric):
+@pytest.mark.parametrize(
+    ("operator", "node_type", "metric"), DISTANCE_OPERATORS
+)
+def test_distance_operator_inside_hybrid_arm(
+    operator, node_type, metric
+) -> None:
     """Same node model inside HYBRID SEARCH as in ORDER BY -- SearchArm.this is the binary node."""
-    ast = _parse(f"SELECT id FROM items HYBRID SEARCH (embedding {operator} :dv) LIMIT 3")
+    ast = _parse(
+        f"SELECT id FROM items HYBRID SEARCH (embedding {operator} :dv) LIMIT 3"
+    )
     (arm,) = ast.args[HYBRID_ARG].expressions
 
     assert isinstance(arm, SearchArm)
@@ -371,13 +391,18 @@ def test_distance_operator_inside_hybrid_arm(operator, node_type, metric):
     assert METRIC_TYPES[type(arm.this)] == metric
 
 
-def test_metric_types_covers_every_distance_node_and_nothing_else():
+def test_metric_types_covers_every_distance_node_and_nothing_else() -> None:
     """A new distance operator that forgets its METRIC_TYPES entry must fail here, not in Track B.
 
     The second assertion is the one with teeth: it derives the set of distance nodes from the module
     (every Binary we define) instead of restating the literal four.
     """
-    assert set(METRIC_TYPES) == {exp.Distance, InnerProduct, CosineDistance, L1Distance}
+    assert set(METRIC_TYPES) == {
+        exp.Distance,
+        InnerProduct,
+        CosineDistance,
+        L1Distance,
+    }
 
     defined_binaries = {
         obj
@@ -390,7 +415,7 @@ def test_metric_types_covers_every_distance_node_and_nothing_else():
     assert set(METRIC_TYPES.values()) == {"L2", "IP", "COSINE", "L1"}
 
 
-def test_cosine_operator_is_not_null_safe_equality():
+def test_cosine_operator_is_not_null_safe_equality() -> None:
     """D3's guard, from the AST side: ``<=>`` must never yield exp.NullSafeEQ in this dialect."""
     ast = _parse("SELECT id FROM items ORDER BY embedding <=> :q LIMIT 3")
 
@@ -403,7 +428,7 @@ def test_cosine_operator_is_not_null_safe_equality():
 # ------------------------------------------------------------------------------------------------
 
 
-def test_ann_search_plan():
+def test_ann_search_plan() -> None:
     plan = ann_search_plan(_parse(ANN_SEARCH))
 
     assert plan == {
@@ -419,7 +444,7 @@ def test_ann_search_plan():
     }
 
 
-def test_ann_search_plan_with_offset_and_multiple_search_params():
+def test_ann_search_plan_with_offset_and_multiple_search_params() -> None:
     sql = (
         "SELECT id FROM items ORDER BY embedding <=> :q LIMIT 10 OFFSET 5 "
         "SEARCH PARAMS (ef_search=64, nprobe=16)"
@@ -433,7 +458,7 @@ def test_ann_search_plan_with_offset_and_multiple_search_params():
     assert plan["filter"] is None
 
 
-def test_ann_search_filter_is_a_live_expression_not_a_string():
+def test_ann_search_filter_is_a_live_expression_not_a_string() -> None:
     """Track B compiles the filter into a Milvus boolean expression, so it needs the subtree."""
     where = _parse(ANN_SEARCH).args["where"]
 
@@ -443,15 +468,21 @@ def test_ann_search_filter_is_a_live_expression_not_a_string():
     assert isinstance(where.this.expression, exp.Placeholder)
 
 
-def test_ann_search_plan_survives_reversed_operands():
+def test_ann_search_plan_survives_reversed_operands() -> None:
     """``:q <-> embedding`` is legal and parses swapped -- position-based extraction would break."""
     sql = "SELECT id FROM items ORDER BY :q <-> embedding LIMIT 10"
     plan = ann_search_plan(_parse(sql))
 
-    assert (plan["column"], plan["metric"], plan["placeholder"]) == ("embedding", "L2", "q")
+    assert (plan["column"], plan["metric"], plan["placeholder"]) == (
+        "embedding",
+        "L2",
+        "q",
+    )
 
 
-def test_a_vector_search_is_recognised_by_a_distance_node_in_order_by():
+def test_a_vector_search_is_recognised_by_a_distance_node_in_order_by() -> (
+    None
+):
     """How Track B routes a SELECT: search() vs hybrid_search() vs a plain query().
 
     Nothing marks a statement as "a vector search" other than the presence of a distance node in
@@ -465,14 +496,19 @@ def test_a_vector_search_is_recognised_by_a_distance_node_in_order_by():
         return bool(order and order.find(*distance_nodes))
 
     assert is_ann_search(_parse(ANN_SEARCH))
-    assert not is_ann_search(_parse("SELECT id FROM items ORDER BY id LIMIT 10"))
-    assert not is_ann_search(_parse("SELECT id FROM items WHERE category = :cat LIMIT 10"))
+    assert not is_ann_search(
+        _parse("SELECT id FROM items ORDER BY id LIMIT 10")
+    )
+    assert not is_ann_search(
+        _parse("SELECT id FROM items WHERE category = :cat LIMIT 10")
+    )
     # A hybrid search has no ORDER BY at all -- it is routed on the HYBRID_ARG key instead.
     hybrid = _parse(HYBRID_SEARCH)
-    assert not is_ann_search(hybrid) and hybrid.args.get(HYBRID_ARG)
+    assert not is_ann_search(hybrid)
+    assert hybrid.args.get(HYBRID_ARG)
 
 
-def test_parser_accepts_a_mixed_order_by():
+def test_parser_accepts_a_mixed_order_by() -> None:
     """Documented gap, not a passing grade: ``ORDER BY <distance>, id`` parses.
 
     Milvus cannot honour a secondary sort key on a vector search, so a translator has to reject
@@ -481,10 +517,13 @@ def test_parser_accepts_a_mixed_order_by():
     """
     ast = _parse("SELECT id FROM items ORDER BY embedding <-> :q, id LIMIT 10")
 
-    assert [type(o.this).__name__ for o in ast.args["order"].expressions] == ["Distance", "Column"]
+    assert [type(o.this).__name__ for o in ast.args["order"].expressions] == [
+        "Distance",
+        "Column",
+    ]
 
 
-def test_search_params_node_shape():
+def test_search_params_node_shape() -> None:
     search_params = _parse(ANN_SEARCH).args[SEARCH_PARAMS_ARG]
 
     assert isinstance(search_params, SearchParams)
@@ -494,7 +533,7 @@ def test_search_params_node_shape():
     assert search_params.expressions[0].name == "ef_search"
 
 
-def test_select_arg_types_declare_the_custom_modifier_keys():
+def test_select_arg_types_declare_the_custom_modifier_keys() -> None:
     """Import-time mutation of ``Select.arg_types``; without it validate_expression rejects both."""
     assert HYBRID_ARG in exp.Select.arg_types
     assert SEARCH_PARAMS_ARG in exp.Select.arg_types
@@ -505,14 +544,24 @@ def test_select_arg_types_declare_the_custom_modifier_keys():
 # ------------------------------------------------------------------------------------------------
 
 
-def test_hybrid_search_plan():
+def test_hybrid_search_plan() -> None:
     plan = hybrid_search_plan(_parse(HYBRID_SEARCH))
 
     assert plan == {
         "table": "items",
         "arms": [
-            {"column": "embedding", "metric": "COSINE", "placeholder": "dv", "weight": 0.7},
-            {"column": "sparse_emb", "metric": "IP", "placeholder": "sv", "weight": 0.3},
+            {
+                "column": "embedding",
+                "metric": "COSINE",
+                "placeholder": "dv",
+                "weight": 0.7,
+            },
+            {
+                "column": "sparse_emb",
+                "metric": "IP",
+                "placeholder": "sv",
+                "weight": 0.3,
+            },
         ],
         "rerank": "RRF",
         "rerank_params": {"k": 60},
@@ -520,7 +569,7 @@ def test_hybrid_search_plan():
     }
 
 
-def test_hybrid_search_node_shape():
+def test_hybrid_search_node_shape() -> None:
     hybrid = _parse(HYBRID_SEARCH).args[HYBRID_ARG]
 
     assert isinstance(hybrid, HybridSearch)
@@ -529,10 +578,12 @@ def test_hybrid_search_node_shape():
     # operator model everywhere means _distance_parts works on ORDER BY and on arms alike.
     assert isinstance(hybrid.expressions[0].this, exp.Binary)
     assert isinstance(hybrid.args["rerank"], Rerank)
-    assert [type(p) for p in hybrid.args["rerank"].args["expressions"]] == [exp.Property]
+    assert [type(p) for p in hybrid.args["rerank"].args["expressions"]] == [
+        exp.Property
+    ]
 
 
-def test_hybrid_search_arm_without_weight():
+def test_hybrid_search_arm_without_weight() -> None:
     """Weight is optional; the plan must report None rather than inventing a default."""
     sql = "SELECT id FROM items HYBRID SEARCH (embedding <=> :dv, sparse_emb <#> :sv) LIMIT 10"
     plan = hybrid_search_plan(_parse(sql))
@@ -542,7 +593,7 @@ def test_hybrid_search_arm_without_weight():
     assert plan["rerank_params"] == {}
 
 
-def test_fractional_literals_arrive_as_decimal_not_float():
+def test_fractional_literals_arrive_as_decimal_not_float() -> None:
     """A sharp edge worth pinning: ``to_py()`` is not float-typed for fractional numbers.
 
     Anything Track B forwards to pymilvus (arm weights, ``radius``, ``range_filter``) has to be
@@ -552,12 +603,18 @@ def test_fractional_literals_arrive_as_decimal_not_float():
     assert isinstance(arm.args["weight"].to_py(), decimal.Decimal)
 
     sql = "SELECT id FROM items ORDER BY embedding <-> :q LIMIT 5 SEARCH PARAMS (radius=0.8)"
-    radius = _parse(sql).args[SEARCH_PARAMS_ARG].expressions[0].args["value"].to_py()
+    radius = (
+        _parse(sql)
+        .args[SEARCH_PARAMS_ARG]
+        .expressions[0]
+        .args["value"]
+        .to_py()
+    )
     assert isinstance(radius, decimal.Decimal)
     assert float(radius) == 0.8
 
 
-def test_hybrid_search_rerank_without_params():
+def test_hybrid_search_rerank_without_params() -> None:
     sql = "SELECT id FROM items HYBRID SEARCH (embedding <=> :dv) RERANK WEIGHTED LIMIT 10"
     plan = hybrid_search_plan(_parse(sql))
 
@@ -570,13 +627,19 @@ def test_hybrid_search_rerank_without_params():
 # ------------------------------------------------------------------------------------------------
 
 
-def test_create_table_plan():
+def test_create_table_plan() -> None:
     plan = create_table_plan(_parse(CREATE_TABLE))
 
     assert plan == {
         "table": "items",
         "fields": [
-            {"name": "id", "type": "BIGINT", "dim": None, "is_primary": True, "auto_id": True},
+            {
+                "name": "id",
+                "type": "BIGINT",
+                "dim": None,
+                "is_primary": True,
+                "auto_id": True,
+            },
             {
                 "name": "embedding",
                 "type": "VECTOR",
@@ -592,11 +655,15 @@ def test_create_table_plan():
                 "auto_id": False,
             },
         ],
-        "properties": {"shards": 2, "consistency_level": "Bounded", "partition_key": "category"},
+        "properties": {
+            "shards": 2,
+            "consistency_level": "Bounded",
+            "partition_key": "category",
+        },
     }
 
 
-def test_vector_dimension_is_recoverable_as_an_int():
+def test_vector_dimension_is_recoverable_as_an_int() -> None:
     """FieldSchema(dim=...) takes an int, so the 768 must not arrive as the string "768"."""
     schema = _parse(CREATE_TABLE).this
     embedding = next(c for c in schema.expressions if c.name == "embedding")
@@ -612,7 +679,7 @@ def test_vector_dimension_is_recoverable_as_an_int():
     assert isinstance(dim, int)
 
 
-def test_create_table_property_value_kinds():
+def test_create_table_property_value_kinds() -> None:
     """Three different value node types in one WITH clause -- the extractor must handle all three.
 
     ``partition_key=category`` is the awkward one: an unquoted value is an ``exp.Var``, and
@@ -621,7 +688,8 @@ def test_create_table_property_value_kinds():
     properties = _parse(CREATE_TABLE).args["properties"]
     by_name = {p.name: p.args["value"] for p in properties.expressions}
 
-    assert isinstance(by_name["shards"], exp.Literal) and by_name["shards"].to_py() == 2
+    assert isinstance(by_name["shards"], exp.Literal)
+    assert by_name["shards"].to_py() == 2
     assert by_name["consistency_level"].to_py() == "Bounded"
     assert isinstance(by_name["partition_key"], exp.Var)
     with pytest.raises(ValueError):
@@ -629,7 +697,7 @@ def test_create_table_property_value_kinds():
     assert by_name["partition_key"].name == "category"
 
 
-def test_add_field_carries_a_columndef():
+def test_add_field_carries_a_columndef() -> None:
     """ALTER TABLE ... ADD FIELD reuses ColumnDef, so the CREATE TABLE field extractor fits it."""
     ast = _parse("ALTER TABLE items ADD FIELD tag VARCHAR(32)")
     (action,) = ast.args["actions"]
@@ -642,13 +710,20 @@ def test_add_field_carries_a_columndef():
 
 
 @pytest.mark.parametrize(
-    "sql,node_type,replicas",
+    ("sql", "node_type", "replicas"),
     [
-        pytest.param("LOAD TABLE items WITH (replicas=2)", milvus_exp.LoadTable, 2, id="load"),
-        pytest.param("RELEASE TABLE items", milvus_exp.ReleaseTable, None, id="release"),
+        pytest.param(
+            "LOAD TABLE items WITH (replicas=2)",
+            milvus_exp.LoadTable,
+            2,
+            id="load",
+        ),
+        pytest.param(
+            "RELEASE TABLE items", milvus_exp.ReleaseTable, None, id="release"
+        ),
     ],
 )
-def test_load_release_shape(sql, node_type, replicas):
+def test_load_release_shape(sql, node_type, replicas) -> None:
     ast = _parse(sql)
 
     assert isinstance(ast, node_type)
@@ -684,12 +759,12 @@ EXPECTED_INDEX_PLAN = {
         ),
     ],
 )
-def test_create_index_plan_is_identical_for_both_word_orders(sql):
+def test_create_index_plan_is_identical_for_both_word_orders(sql) -> None:
     """D6: the two accepted spellings must produce the same plan, not merely the same text."""
     assert create_index_plan(_parse(sql)) == EXPECTED_INDEX_PLAN
 
 
-def test_create_index_node_shape():
+def test_create_index_node_shape() -> None:
     ast = _parse(CREATE_INDEX)
     index = ast.this
 
@@ -714,19 +789,27 @@ def test_create_index_node_shape():
 
 
 @pytest.mark.parametrize(
-    "sql,columns",
+    ("sql", "columns"),
     [
-        pytest.param(HYBRID_SEARCH, ["embedding", "id", "sparse_emb"], id="hybrid-arms"),
-        pytest.param(ANN_SEARCH, ["category", "category", "embedding", "id"], id="ann-order-by"),
-        pytest.param(FULL_TEXT_SEARCH, ["id", "text", "text"], id="match-and-bm25"),
+        pytest.param(
+            HYBRID_SEARCH, ["embedding", "id", "sparse_emb"], id="hybrid-arms"
+        ),
+        pytest.param(
+            ANN_SEARCH,
+            ["category", "category", "embedding", "id"],
+            id="ann-order-by",
+        ),
+        pytest.param(
+            FULL_TEXT_SEARCH, ["id", "text", "text"], id="match-and-bm25"
+        ),
         pytest.param(CREATE_INDEX, ["embedding"], id="index-columns"),
     ],
 )
-def test_find_all_columns_reaches_into_custom_nodes(sql, columns):
+def test_find_all_columns_reaches_into_custom_nodes(sql, columns) -> None:
     assert sorted(c.name for c in _parse(sql).find_all(exp.Column)) == columns
 
 
-def test_find_all_reaches_placeholders_under_every_custom_node():
+def test_find_all_reaches_placeholders_under_every_custom_node() -> None:
     sql = (
         "SELECT id FROM items HYBRID SEARCH (embedding <=> :dv WEIGHT :w) RERANK RRF(k=:k) "
         "LIMIT 10 SEARCH PARAMS (ef_search=:ef)"
@@ -735,10 +818,15 @@ def test_find_all_reaches_placeholders_under_every_custom_node():
 
     # :dv is under SearchArm -> CosineDistance, :w under SearchArm.weight, :k under Rerank ->
     # Property, :ef under SearchParams -> Property. All four must surface from the root.
-    assert {p.name for p in ast.find_all(exp.Placeholder)} == {"dv", "w", "k", "ef"}
+    assert {p.name for p in ast.find_all(exp.Placeholder)} == {
+        "dv",
+        "w",
+        "k",
+        "ef",
+    }
 
 
-def test_custom_nodes_are_findable_by_their_own_class():
+def test_custom_nodes_are_findable_by_their_own_class() -> None:
     ast = _parse(HYBRID_SEARCH)
 
     assert len(list(ast.find_all(HybridSearch))) == 1
@@ -748,7 +836,7 @@ def test_custom_nodes_are_findable_by_their_own_class():
     assert len(list(_parse(FULL_TEXT_SEARCH).find_all(BM25Score))) == 1
 
 
-def test_parent_links_are_wired_through_custom_nodes():
+def test_parent_links_are_wired_through_custom_nodes() -> None:
     """``parent``/``arg_key``/``parent_select`` drive replace(), scope building and lineage."""
     ast = _parse(HYBRID_SEARCH)
     hybrid = ast.args[HYBRID_ARG]
@@ -762,7 +850,9 @@ def test_parent_links_are_wired_through_custom_nodes():
 
     column = arm.this.this
     assert isinstance(column, exp.Column)
-    assert [type(n).__name__ for n in (column.parent, column.parent.parent)] == [
+    assert [
+        type(n).__name__ for n in (column.parent, column.parent.parent)
+    ] == [
         "CosineDistance",
         "SearchArm",
     ]
@@ -771,7 +861,7 @@ def test_parent_links_are_wired_through_custom_nodes():
     assert column.parent_select is ast
 
 
-def test_nodes_inside_custom_expressions_can_be_replaced():
+def test_nodes_inside_custom_expressions_can_be_replaced() -> None:
     ast = _parse(HYBRID_SEARCH)
     column = next(c for c in ast.find_all(exp.Column) if c.name == "embedding")
     column.replace(exp.column("emb_v2"))
@@ -779,26 +869,32 @@ def test_nodes_inside_custom_expressions_can_be_replaced():
     assert "emb_v2 <=> :dv" in ast.sql(dialect="milvus")
 
 
-def test_copy_deep_copies_custom_nodes():
+def test_copy_deep_copies_custom_nodes() -> None:
     ast = _parse(HYBRID_SEARCH)
     clone = ast.copy()
-    clone.args[HYBRID_ARG].expressions[0].set("weight", exp.Literal.number("0.9"))
+    clone.args[HYBRID_ARG].expressions[0].set(
+        "weight", exp.Literal.number("0.9")
+    )
 
     assert ast.sql(dialect="milvus") == HYBRID_SEARCH
     assert "WEIGHT 0.9" in clone.sql(dialect="milvus")
 
 
-def test_transform_rewrites_bind_parameters_inside_custom_nodes():
+def test_transform_rewrites_bind_parameters_inside_custom_nodes() -> None:
     """A whole-tree rewrite must see into the custom nodes; the optimizer works exactly this way."""
     ast = _parse(HYBRID_SEARCH).transform(
-        lambda node: exp.Literal.number(1) if isinstance(node, exp.Placeholder) else node
+        lambda node: (
+            exp.Literal.number(1)
+            if isinstance(node, exp.Placeholder)
+            else node
+        )
     )
 
     assert not list(ast.find_all(exp.Placeholder))
     assert "embedding <=> 1 WEIGHT 0.7" in ast.sql(dialect="milvus")
 
 
-def test_scope_sees_columns_inside_hybrid_search():
+def test_scope_sees_columns_inside_hybrid_search() -> None:
     """The optimizer does not use ``find_all``: ``walk_in_scope`` iterates ``node.args`` itself.
 
     So this is a genuinely separate traversal path, and it only reaches our arms because they hold
@@ -806,13 +902,23 @@ def test_scope_sees_columns_inside_hybrid_search():
     """
     scope = build_scope(_parse(HYBRID_SEARCH))
 
-    assert sorted(c.name for c in scope.columns) == ["embedding", "id", "sparse_emb"]
+    assert sorted(c.name for c in scope.columns) == [
+        "embedding",
+        "id",
+        "sparse_emb",
+    ]
 
 
 @pytest.mark.parametrize(
-    "sql", [pytest.param(ANN_SEARCH, id="ann"), pytest.param(HYBRID_SEARCH, id="hybrid")]
+    "sql",
+    [
+        pytest.param(ANN_SEARCH, id="ann"),
+        pytest.param(HYBRID_SEARCH, id="hybrid"),
+    ],
 )
-def test_qualify_resolves_columns_inside_custom_nodes_without_touching_placeholders(sql):
+def test_qualify_resolves_columns_inside_custom_nodes_without_touching_placeholders(
+    sql,
+) -> None:
     """The strongest traversal evidence: a real optimizer rule rewriting inside our nodes.
 
     It also guards the invariant from the other direction -- qualify must not decide that ``:dv``
@@ -836,7 +942,11 @@ def test_qualify_resolves_columns_inside_custom_nodes_without_touching_placehold
     assert '"items"."embedding"' in out
     # Knob names must stay Vars: had SEARCH PARAMS/RERANK parsed "ef_search=64" as EQ(Column, 64),
     # qualify would now be trying to resolve a column that does not exist.
-    assert not [c for c in qualified.find_all(exp.Column) if c.name in {"ef_search", "k"}]
+    assert not [
+        c
+        for c in qualified.find_all(exp.Column)
+        if c.name in {"ef_search", "k"}
+    ]
 
 
 # ------------------------------------------------------------------------------------------------
@@ -849,9 +959,15 @@ def test_qualify_resolves_columns_inside_custom_nodes_without_touching_placehold
     reason="known gap: a foreign generator drops HYBRID SEARCH / SEARCH PARAMS silently",
 )
 @pytest.mark.parametrize(
-    "dialect", [pytest.param(None, id="default"), pytest.param("postgres", id="postgres")]
+    "dialect",
+    [
+        pytest.param(None, id="default"),
+        pytest.param("postgres", id="postgres"),
+    ],
 )
-def test_foreign_dialect_generation_must_not_silently_drop_search_clauses(dialect):
+def test_foreign_dialect_generation_must_not_silently_drop_search_clauses(
+    dialect,
+) -> None:
     """Generating a MilvusQL AST with any other dialect throws the vector search away.
 
     ``SELECT ... HYBRID SEARCH (...) RERANK ... LIMIT 10`` comes back as ``SELECT ... LIMIT 10``:
@@ -867,4 +983,6 @@ def test_foreign_dialect_generation_must_not_silently_drop_search_clauses(dialec
     """
     ast = _parse(HYBRID_SEARCH)
 
-    assert "HYBRID SEARCH" in ast.sql(dialect=dialect, unsupported_level=ErrorLevel.RAISE)
+    assert "HYBRID SEARCH" in ast.sql(
+        dialect=dialect, unsupported_level=ErrorLevel.RAISE
+    )

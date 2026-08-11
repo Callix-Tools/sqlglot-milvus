@@ -8,7 +8,9 @@ has nothing to do with vector search:
     * rebinds ``<=>`` from null-safe equality to cosine distance;
     * deletes ``TokenType.NULLSAFE_EQ`` from ``EQUALITY``;
     * registers two multi-word keywords and one genuinely reserved single word;
-    * injects two ``QUERY_MODIFIER_PARSERS`` and a hand-written post-parse clause-order validator.
+    * wraps *every* ``QUERY_MODIFIER_PARSERS`` entry, ours and upstream's, to record where each
+      clause fired, and injects a clause-order validator on top of that;
+    * declares its two search clauses as extra args on ``Select``/``Subquery``/``SetOperation``.
 
 The dominant technique here is **differential testing against sqlglot's own dialect-neutral
 parser** (``read=None``). Asserting "milvus behaves exactly as stock sqlglot does" is far stronger
@@ -27,8 +29,11 @@ import pickle
 import pytest
 import sqlglot
 from sqlglot import exp, serde
-from sqlglot.dialects.dialect import Dialect
+from sqlglot.dialects.dialect import Dialect, NormalizationStrategy
 from sqlglot.errors import ErrorLevel, ParseError, UnsupportedError
+from sqlglot.optimizer import optimize
+from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
+from sqlglot.optimizer.qualify import qualify
 from sqlglot.parsers.base import BaseParser
 from sqlglot.tokens import Tokenizer, TokenType
 
@@ -40,6 +45,7 @@ from sqlglot_milvus import (
     LoadTable,
     ReleaseTable,
     SearchArm,
+    SearchParams,
 )
 from sqlglot_milvus._tokens import (
     EXPECTED_TOKEN_TYPE_COUNT,
@@ -50,9 +56,16 @@ from sqlglot_milvus._tokens import (
     TT_SEARCH_PARAMS,
 )
 from sqlglot_milvus.dialect import Milvus
+from sqlglot_milvus.dialect import Milvus as _Milvus
 from sqlglot_milvus.expressions import HYBRID_ARG, SEARCH_PARAMS_ARG
 
-RECYCLED = {TT_INNER_PRODUCT, TT_L1, TT_HYBRID_SEARCH, TT_SEARCH_PARAMS, TT_RELEASE}
+RECYCLED = {
+    TT_INNER_PRODUCT,
+    TT_L1,
+    TT_HYBRID_SEARCH,
+    TT_SEARCH_PARAMS,
+    TT_RELEASE,
+}
 
 
 def parse(sql: str, dialect: str | None = "milvus"):
@@ -67,10 +80,16 @@ def behaviour(sql: str, dialect: str | None):
     divergence *between* the two dialects -- i.e. something we caused -- can fail it.
     """
     try:
-        ast = sqlglot.parse_one(sql, read=dialect, error_level=ErrorLevel.RAISE)
-    except Exception as error:  # noqa: BLE001 - the exception itself is the observation
+        ast = sqlglot.parse_one(
+            sql, read=dialect, error_level=ErrorLevel.RAISE
+        )
+    except Exception as error:
         return ("raised", type(error).__name__, str(error).splitlines()[0])
-    return (type(ast).__name__, ast.sql(dialect=dialect), isinstance(ast, exp.Command))
+    return (
+        type(ast).__name__,
+        ast.sql(dialect=dialect),
+        isinstance(ast, exp.Command),
+    )
 
 
 def _clauses(select: exp.Select) -> dict:
@@ -81,7 +100,9 @@ def _clauses(select: exp.Select) -> dict:
 def assert_stable(sql: str, node_type: type[exp.Expression]) -> exp.Expression:
     """The D12 four-property contract, reused for the MilvusQL statements this file exercises."""
     ast = parse(sql)
-    assert not isinstance(ast, exp.Command), "degraded to an opaque exp.Command blob"
+    assert not isinstance(ast, exp.Command), (
+        "degraded to an opaque exp.Command blob"
+    )
     assert isinstance(ast, node_type)
     out = ast.sql(dialect="milvus", unsupported_level=ErrorLevel.RAISE)
     assert out == sql
@@ -126,46 +147,64 @@ IDENTIFIER_POSITIONS = {
     "join-on": "SELECT a FROM t JOIN u ON t.{w} = u.{w}",
     "function-1-arg": "SELECT {w}(a) FROM t",
     "function-2-args": "SELECT {w}(a, b) FROM t",
+    # The five positions that do *not* consult ID_VAR_TOKENS. Each is a separate class-level
+    # snapshot of the base set taken before our patch, so un-reserving RELEASE in ID_VAR_TOKENS
+    # alone left every one of them rejecting it (see the FUNC_TOKENS regression below).
+    "bare-column-alias": "SELECT a {w} FROM t",
+    "update-bare-alias": "UPDATE t {w} SET a = 1",
+    "unnest-offset-alias": "SELECT * FROM UNNEST(x) WITH OFFSET AS {w}",
 }
-
-# FINDING 1. `RELEASE` owns a TokenType so that it can open a statement, and the parser adds it
-# back to ID_VAR_TOKENS / TABLE_ALIAS_TOKENS -- but not to FUNC_TOKENS, which is the set
-# _parse_function consults. So `release(a)` is not recognised as a call, falls through to the
-# postfix-alias rule and becomes exp.Aliases, which regenerates as the syntactically invalid
-# `release AS (a)`. Silent, and only in this one position. Fix: FUNC_TOKENS |= {TT_RELEASE}.
-_RELEASE_FUNC_BUG = pytest.mark.xfail(
-    strict=True,
-    reason="TT_RELEASE missing from Parser.FUNC_TOKENS; see test_release_as_function_name_is_mangled",
-)
 
 
 def _identifier_cases():
     for label, template in IDENTIFIER_POSITIONS.items():
         for word in KEYWORD_WORDS:
-            broken = word == "release" and label.startswith("function")
-            yield pytest.param(
-                template.format(w=word),
-                marks=[_RELEASE_FUNC_BUG] if broken else [],
-                id=f"{label}-{word}",
-            )
+            yield pytest.param(template.format(w=word), id=f"{label}-{word}")
 
 
 @pytest.mark.parametrize("sql", list(_identifier_cases()))
-def test_new_keywords_remain_usable_as_identifiers(sql):
+def test_new_keywords_remain_usable_as_identifiers(sql) -> None:
     assert behaviour(sql, "milvus") == behaviour(sql, None)
 
 
-def test_release_as_function_name_is_mangled():
-    """Pins FINDING 1's *actual* output, because "wrong" understates it: the emitted text is not
-    valid SQL in any dialect, and nothing warns."""
-    ast = parse("SELECT release(a) FROM t")
-    assert isinstance(ast.expressions[0], exp.Aliases)
-    assert ast.sql("milvus") == "SELECT release AS (a) FROM t"
+def test_release_is_un_reserved_in_every_identifier_token_set() -> None:
+    """RELEASE was added back to ID_VAR_TOKENS and TABLE_ALIAS_TOKENS only, which made
+    ``SELECT release(a) FROM t`` fall out of _parse_function into the postfix-alias rule and become
+    ``release AS (a)`` -- text that is not valid SQL in any dialect, emitted without a warning.
+
+    The eight sets below are independent snapshots, not views, so this is the tripwire for the next
+    one upstream adds: it fails on the *set*, not on one hand-picked query.
+    """
+    for name in (
+        "ID_VAR_TOKENS",
+        "TABLE_ALIAS_TOKENS",
+        "ALIAS_TOKENS",
+        "UPDATE_ALIAS_TOKENS",
+        "UNNEST_OFFSET_ALIAS_TOKENS",
+        "FUNC_TOKENS",
+        "COMMENT_TABLE_ALIAS_TOKENS",
+        "WINDOW_ALIAS_TOKENS",
+        "COLON_PLACEHOLDER_TOKENS",
+    ):
+        ours = getattr(_Milvus.Parser, name)
+        base = getattr(BaseParser, name)
+        assert TT_RELEASE in ours, f"{name} still reserves RELEASE"
+        # ... and nothing else moved: COLON_PLACEHOLDER_TOKENS was assigned our ID_VAR_TOKENS
+        # wholesale, which silently *dropped* upstream's STRAIGHT_JOIN entry along the way.
+        assert ours - base == {TT_RELEASE}, (
+            f"{name} diverges from upstream beyond RELEASE"
+        )
 
 
-@pytest.mark.xfail(strict=True, reason="FINDING 1: TT_RELEASE missing from Parser.FUNC_TOKENS")
-def test_release_should_be_usable_as_a_function_name():
-    assert isinstance(parse("SELECT release(a) FROM t").expressions[0], exp.Anonymous)
+def test_straight_join_is_still_a_named_placeholder() -> None:
+    # The casualty of the wholesale COLON_PLACEHOLDER_TOKENS assignment: `:straight_join` is a
+    # legal name in the `named` paramstyle Track B uses, and it became a ParseError.
+    assert behaviour(
+        "SELECT a FROM t WHERE b = :straight_join", "milvus"
+    ) == behaviour("SELECT a FROM t WHERE b = :straight_join", None)
+    assert parse("SELECT a FROM t WHERE b = :straight_join").sql("milvus") == (
+        "SELECT a FROM t WHERE b = :straight_join"
+    )
 
 
 # FINDING 2. The multi-word keywords are lexed by longest match on the *token stream*, so two bare
@@ -180,8 +219,12 @@ def test_release_should_be_usable_as_a_function_name():
         "SELECT a FROM hybrid search",
     ],
 )
-def test_adjacent_bare_words_forming_a_multiword_keyword_are_rejected(sql):
-    assert behaviour(sql, None)[0] == "Select"  # stock sqlglot reads these as implicit aliases
+def test_adjacent_bare_words_forming_a_multiword_keyword_are_rejected(
+    sql,
+) -> None:
+    assert (
+        behaviour(sql, None)[0] == "Select"
+    )  # stock sqlglot reads these as implicit aliases
     with pytest.raises(ParseError):
         parse(sql)
 
@@ -197,7 +240,7 @@ def test_adjacent_bare_words_forming_a_multiword_keyword_are_rejected(sql):
         "SELECT a FROM t WHERE search = params",
     ],
 )
-def test_multiword_collision_has_a_workaround(sql):
+def test_multiword_collision_has_a_workaround(sql) -> None:
     assert behaviour(sql, "milvus") == behaviour(sql, None)
 
 
@@ -213,12 +256,12 @@ def test_multiword_collision_has_a_workaround(sql):
 # words behind the recycled members.
 
 
-def test_token_type_member_count_is_pinned():
+def test_token_type_member_count_is_pinned() -> None:
     assert len(list(TokenType)) == EXPECTED_TOKEN_TYPE_COUNT
 
 
 @pytest.mark.parametrize(
-    "name,alias",
+    ("name", "alias"),
     [
         ("SPACE", TT_INNER_PRODUCT),
         ("BREAK", TT_L1),
@@ -227,37 +270,50 @@ def test_token_type_member_count_is_pinned():
         ("SOUNDS_LIKE", TT_RELEASE),
     ],
 )
-def test_recycled_members_still_exist_under_the_expected_names(name, alias):
+def test_recycled_members_still_exist_under_the_expected_names(
+    name, alias
+) -> None:
     # Looked up by *string*, so an upstream rename fails here rather than at import time with a
     # traceback that says nothing about why the name mattered.
     assert getattr(TokenType, name, None) is alias
 
 
-def test_recycled_members_are_five_distinct_members():
+def test_recycled_members_are_five_distinct_members() -> None:
     assert len(RECYCLED) == 5
-    assert not RECYCLED & {TokenType.LIMIT, TokenType.NULLSAFE_EQ, TokenType.LOAD, TokenType.TABLE}
+    assert not RECYCLED & {
+        TokenType.LIMIT,
+        TokenType.NULLSAFE_EQ,
+        TokenType.LOAD,
+        TokenType.TABLE,
+    }
 
 
-def test_base_tokenizer_assigns_no_keyword_to_a_recycled_member():
-    assert [kw for kw, tt in Tokenizer.KEYWORDS.items() if tt in RECYCLED] == []
+def test_base_tokenizer_assigns_no_keyword_to_a_recycled_member() -> None:
+    assert [
+        kw for kw, tt in Tokenizer.KEYWORDS.items() if tt in RECYCLED
+    ] == []
 
 
-def test_no_builtin_dialect_assigns_a_keyword_to_a_recycled_member():
+def test_no_builtin_dialect_assigns_a_keyword_to_a_recycled_member() -> None:
     # Dialect.classes[""] is the bare Dialect, which has no Tokenizer of its own.
     offenders = {
         name: [
             kw
-            for kw, tt in getattr(dialect, "Tokenizer", Tokenizer).KEYWORDS.items()
+            for kw, tt in getattr(
+                dialect, "Tokenizer", Tokenizer
+            ).KEYWORDS.items()
             if tt in RECYCLED
         ]
         for name, dialect in Dialect.classes.items()
         if name != "milvus"
     }
     assert {n: kws for n, kws in offenders.items() if kws} == {}
-    assert len(Dialect.classes) > 20  # guard against the loop above silently iterating nothing
+    assert (
+        len(Dialect.classes) > 20
+    )  # guard against the loop above silently iterating nothing
 
 
-def test_base_parser_gives_no_behaviour_to_a_recycled_member():
+def test_base_parser_gives_no_behaviour_to_a_recycled_member() -> None:
     """Recycling is only safe while these members are inert everywhere in sqlglot -- not merely
     absent from KEYWORDS, but absent from every token set and token-keyed dispatch table."""
     hits = {}
@@ -284,7 +340,7 @@ def test_base_parser_gives_no_behaviour_to_a_recycled_member():
         "CREATE TABLE t (a INT) WITH (properties=1)",
     ],
 )
-def test_words_behind_recycled_members_are_unaffected(sql):
+def test_words_behind_recycled_members_are_unaffected(sql) -> None:
     assert behaviour(sql, "milvus") == behaviour(sql, None)
 
 
@@ -293,15 +349,17 @@ def test_words_behind_recycled_members_are_unaffected(sql):
 # =================================================================================================
 
 
-def test_only_nullsafe_eq_was_removed_from_equality():
-    assert set(BaseParser.EQUALITY) - set(Milvus.Parser.EQUALITY) == {TokenType.NULLSAFE_EQ}
+def test_only_nullsafe_eq_was_removed_from_equality() -> None:
+    assert set(BaseParser.EQUALITY) - set(Milvus.Parser.EQUALITY) == {
+        TokenType.NULLSAFE_EQ
+    }
     assert set(Milvus.Parser.EQUALITY) - set(BaseParser.EQUALITY) == set()
     # ... and it landed in FACTOR, which is where the rebinding actually happens.
     assert Milvus.Parser.FACTOR[TokenType.NULLSAFE_EQ] is CosineDistance
 
 
 @pytest.mark.parametrize(
-    "sql,node",
+    ("sql", "node"),
     [
         ("SELECT a FROM t WHERE a = 1", exp.EQ),
         ("SELECT a FROM t WHERE a != 1", exp.NEQ),
@@ -316,41 +374,51 @@ def test_only_nullsafe_eq_was_removed_from_equality():
         ("SELECT a FROM t WHERE NOT a IN (1, 2)", exp.Not),
         ("SELECT a FROM t WHERE a LIKE '%x%'", exp.Like),
         ("SELECT a FROM t WHERE a ILIKE '%x%'", exp.ILike),
-        ("SELECT a FROM t WHERE a NOT LIKE '%x%'", exp.Like),  # exp.Like(negate=True)
+        (
+            "SELECT a FROM t WHERE a NOT LIKE '%x%'",
+            exp.Like,
+        ),  # exp.Like(negate=True)
         ("SELECT a FROM t WHERE a BETWEEN 1 AND 2", exp.Between),
         ("SELECT a FROM t WHERE a IS DISTINCT FROM b", exp.NullSafeNEQ),
     ],
     ids=lambda v: v.split("WHERE ")[-1] if isinstance(v, str) else v.__name__,
 )
-def test_every_other_comparison_operator_survived(sql, node):
+def test_every_other_comparison_operator_survived(sql, node) -> None:
     assert behaviour(sql, "milvus") == behaviour(sql, None)
     assert isinstance(parse(sql).args["where"].this, node)
 
 
-def test_nullsafe_eq_is_cosine_distance_here():
+def test_nullsafe_eq_is_cosine_distance_here() -> None:
     ast = assert_stable("SELECT a <=> b FROM t", exp.Select)
     assert isinstance(ast.expressions[0], CosineDistance)
 
 
-def test_mysql_nullsafe_eq_never_becomes_a_vector_search():
+def test_mysql_nullsafe_eq_never_becomes_a_vector_search() -> None:
     # The whole point of D3's fourth guard: the six characters must not survive a transpile.
     with pytest.raises(UnsupportedError):
         sqlglot.transpile(
-            "SELECT a <=> b FROM t", read="mysql", write="milvus", unsupported_level=ErrorLevel.RAISE
+            "SELECT a <=> b FROM t",
+            read="mysql",
+            write="milvus",
+            unsupported_level=ErrorLevel.RAISE,
         )
-    assert sqlglot.transpile("SELECT a <=> b FROM t", read="mysql", write="milvus") == [
-        "SELECT a IS NOT DISTINCT FROM b FROM t"
-    ]
+    assert sqlglot.transpile(
+        "SELECT a <=> b FROM t", read="mysql", write="milvus"
+    ) == ["SELECT a IS NOT DISTINCT FROM b FROM t"]
 
 
-def test_is_not_distinct_from_parses_but_cannot_be_re_emitted_strictly():
+def test_is_not_distinct_from_parses_but_cannot_be_re_emitted_strictly() -> (
+    None
+):
     """FINDING 3. The refusal to emit exp.NullSafeEQ is aimed at mysql -> milvus, but the milvus
     *parser* still accepts the ANSI spelling and produces the very node the generator refuses. So
     a query MilvusQL happily reads cannot be regenerated under unsupported_level=RAISE -- the
     node type, not its provenance, is what the guard keys on."""
     ast = parse("SELECT a FROM t WHERE a IS NOT DISTINCT FROM b")
     assert isinstance(ast.args["where"].this, exp.NullSafeEQ)
-    assert ast.sql("milvus") == "SELECT a FROM t WHERE a IS NOT DISTINCT FROM b"
+    assert (
+        ast.sql("milvus") == "SELECT a FROM t WHERE a IS NOT DISTINCT FROM b"
+    )
     with pytest.raises(UnsupportedError):
         ast.sql("milvus", unsupported_level=ErrorLevel.RAISE)
 
@@ -375,19 +443,25 @@ def test_is_not_distinct_from_parses_but_cannot_be_re_emitted_strictly():
         "SELECT JSON_EXTRACT(a, '$.b') FROM t",
     ],
 )
-def test_json_operators_are_untouched_by_the_inner_product_operator(sql):
+def test_json_operators_are_untouched_by_the_inner_product_operator(
+    sql,
+) -> None:
     assert behaviour(sql, "milvus") == behaviour(sql, None)
 
 
-def test_json_operators_still_produce_json_nodes():
+def test_json_operators_still_produce_json_nodes() -> None:
     # Pinned explicitly: an opaque `behaviour()` match would also be satisfied if *both* dialects
     # regressed to something meaningless.
-    assert isinstance(parse("SELECT a -> 'b' FROM t").expressions[0], exp.JSONExtract)
-    assert isinstance(parse("SELECT a #> 'b' FROM t").expressions[0], exp.JSONBExtract)
+    assert isinstance(
+        parse("SELECT a -> 'b' FROM t").expressions[0], exp.JSONExtract
+    )
+    assert isinstance(
+        parse("SELECT a #> 'b' FROM t").expressions[0], exp.JSONBExtract
+    )
 
 
 @pytest.mark.parametrize(
-    "sql,node",
+    ("sql", "node"),
     [
         ("SELECT a <-> b FROM t", exp.Distance),
         ("SELECT a <#> b FROM t", InnerProduct),
@@ -396,12 +470,15 @@ def test_json_operators_still_produce_json_nodes():
     ],
     ids=["l2", "ip", "cosine", "l1"],
 )
-def test_distance_operators(sql, node):
+def test_distance_operators(sql, node) -> None:
     assert isinstance(assert_stable(sql, exp.Select).expressions[0], node)
 
 
-@pytest.mark.parametrize("sql", ["SELECT a <+ 1 FROM t", "SELECT a < +1 FROM t", "SELECT a <@ b FROM t"])
-def test_operators_that_merely_start_like_ours_are_unaffected(sql):
+@pytest.mark.parametrize(
+    "sql",
+    ["SELECT a <+ 1 FROM t", "SELECT a < +1 FROM t", "SELECT a <@ b FROM t"],
+)
+def test_operators_that_merely_start_like_ours_are_unaffected(sql) -> None:
     assert behaviour(sql, "milvus") == behaviour(sql, None)
 
 
@@ -418,15 +495,17 @@ def test_operators_that_merely_start_like_ours_are_unaffected(sql):
         "LOAD DATA INPATH 'x' INTO TABLE t PARTITION (a=1)",
     ],
 )
-def test_load_data_is_unchanged(sql):
+def test_load_data_is_unchanged(sql) -> None:
     assert behaviour(sql, "milvus") == behaviour(sql, None)
     # _parse_milvus_load retreats and calls super() only when the next token is not TABLE; assert
     # the delegation actually happened rather than trusting the round-trip.
     assert isinstance(parse(sql), exp.LoadData)
 
 
-@pytest.mark.parametrize("sql", ["LOAD TABLE items", "LOAD TABLE items WITH (replicas=2)"])
-def test_load_table_is_ours(sql):
+@pytest.mark.parametrize(
+    "sql", ["LOAD TABLE items", "LOAD TABLE items WITH (replicas=2)"]
+)
+def test_load_table_is_ours(sql) -> None:
     assert_stable(sql, LoadTable)
 
 
@@ -435,13 +514,18 @@ def test_load_table_is_ours(sql):
 # =================================================================================================
 
 
-def test_query_modifier_tokens_is_keyed_only_on_token_types_we_own():
+def test_query_modifier_tokens_is_keyed_only_on_token_types_we_own() -> None:
     # The documented trap (ground truth §3.5): recomputing QUERY_MODIFIER_TOKENS locally breaks
     # every `GROUP BY <column>` *if* a modifier is keyed on TokenType.VAR. We key on dedicated
     # (recycled) members instead, which is why the recomputation below is safe.
     assert TokenType.VAR not in Milvus.Parser.QUERY_MODIFIER_TOKENS
-    assert set(BaseParser.QUERY_MODIFIER_PARSERS) < Milvus.Parser.QUERY_MODIFIER_TOKENS
-    assert Milvus.Parser.QUERY_MODIFIER_TOKENS - set(BaseParser.QUERY_MODIFIER_PARSERS) == {
+    assert (
+        set(BaseParser.QUERY_MODIFIER_PARSERS)
+        < Milvus.Parser.QUERY_MODIFIER_TOKENS
+    )
+    assert Milvus.Parser.QUERY_MODIFIER_TOKENS - set(
+        BaseParser.QUERY_MODIFIER_PARSERS
+    ) == {
         TT_HYBRID_SEARCH,
         TT_SEARCH_PARAMS,
     }
@@ -482,7 +566,9 @@ def test_query_modifier_tokens_is_keyed_only_on_token_types_we_own():
         "SELECT a FROM t WHERE EXISTS(SELECT 1 FROM u)",
     ],
 )
-def test_untouched_query_modifiers_behave_exactly_as_stock_sqlglot(sql):
+def test_untouched_query_modifiers_behave_exactly_as_stock_sqlglot(
+    sql,
+) -> None:
     assert behaviour(sql, "milvus") == behaviour(sql, None)
 
 
@@ -493,7 +579,7 @@ def test_untouched_query_modifiers_behave_exactly_as_stock_sqlglot(sql):
         "SELECT category FROM items GROUP BY category HAVING COUNT(*) > 1 LIMIT 10 SEARCH PARAMS (ef=1)",
     ],
 )
-def test_group_by_column_survives_next_to_our_modifiers(sql):
+def test_group_by_column_survives_next_to_our_modifiers(sql) -> None:
     # The precise shape the ground truth warns about: a non-empty GROUP BY list whose terminator
     # is one of our modifier tokens.
     ast = assert_stable(sql, exp.Select)
@@ -501,28 +587,71 @@ def test_group_by_column_survives_next_to_our_modifiers(sql):
 
 
 @pytest.mark.parametrize(
-    "sql",
-    ["SELECT a FROM t ORDER BY a NULLS FIRST", "SELECT a FROM t ORDER BY a ASC NULLS LAST"],
+    ("sql", "emitted", "loud"),
+    [
+        (
+            "SELECT a FROM t ORDER BY a NULLS FIRST",
+            "SELECT a FROM t ORDER BY a",
+            True,
+        ),
+        (
+            "SELECT a FROM t ORDER BY a ASC NULLS LAST",
+            "SELECT a FROM t ORDER BY a ASC",
+            False,
+        ),
+    ],
+    ids=["nulls-first", "nulls-last"],
 )
-def test_null_ordering_differs_from_stock_and_that_is_deliberate(sql):
-    """NULL_ORDERING = "nulls_are_last" is what suppresses a spurious " NULLS LAST" in generated
-    index column lists. The visible side effect is that an explicit, redundant NULLS LAST is
-    dropped -- semantics preserved, text not. Pinned so a change to NULL_ORDERING shows up here."""
-    assert behaviour(sql, "milvus") != behaviour(sql, None)
-    assert parse(sql).sql("milvus") in (
-        "SELECT a FROM t ORDER BY a NULLS FIRST",
-        "SELECT a FROM t ORDER BY a ASC",
-    )
+def test_null_ordering_differs_from_stock_and_that_is_deliberate(
+    sql, emitted, loud
+) -> None:
+    """MilvusQL has no NULLS FIRST/LAST grammar at all, so neither spelling can be emitted.
+
+    NULLS LAST is the declared default (NULL_ORDERING) and drops out silently -- semantics
+    preserved, text not. NULLS FIRST is a request the language cannot express, so it is reported as
+    unsupported rather than dropped quietly or spelled in invented syntax.
+    """
+    assert parse(sql).sql("milvus") == emitted
+    if loud:
+        with pytest.raises(UnsupportedError, match="NULLS FIRST"):
+            parse(sql).sql("milvus", unsupported_level=ErrorLevel.RAISE)
+    else:
+        assert behaviour(sql, "milvus") != behaviour(sql, None)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: exp.select("id").from_("t").order_by("id"),
+        lambda: sqlglot.parse_one(
+            "SELECT id FROM t ORDER BY id", read="mysql"
+        ),
+    ],
+    ids=["builder", "mysql-front-end"],
+)
+def test_a_plain_order_by_never_grows_a_nulls_first(build) -> None:
+    """sqlglot's own builders and the MySQL parser both set ``Ordered(nulls_first=True)`` for a
+    bare ``ORDER BY id``. Emitting that as " NULLS FIRST" would put a clause MilvusQL has no
+    grammar for into text neither the caller nor the source query ever mentioned -- and it hits the
+    single most idiomatic way to construct a query."""
+    ast = build()
+    assert (
+        ast.find(exp.Ordered).args.get("nulls_first") is True
+    )  # the input really is the trap
+    assert ast.sql("milvus") == "SELECT id FROM t ORDER BY id"
+    with pytest.raises(UnsupportedError, match="NULLS FIRST"):
+        ast.sql("milvus", unsupported_level=ErrorLevel.RAISE)
 
 
 # =================================================================================================
 # 7. Nested contexts vs the clause-order validator
 # =================================================================================================
 #
-# _validate_clause_order rescans a raw token range with hand-rolled paren-depth tracking. Anything
-# it mistakes for a top-level LIMIT / HYBRID SEARCH / SEARCH PARAMS becomes a spurious ParseError
-# on legal SQL. Every case below has an inner LIMIT (or an inner copy of our own clauses) that
-# must be invisible to the outer query's check, and vice versa.
+# _validate_clause_order used to rescan a raw token range with hand-rolled paren-depth tracking,
+# so anything it mistook for a top-level LIMIT / HYBRID SEARCH / SEARCH PARAMS became a spurious
+# ParseError on legal SQL. It now works from positions recorded by the modifier parsers themselves.
+# Every case below has an inner LIMIT (or an inner copy of our own clauses) that must be invisible
+# to the outer query's check, and vice versa.
 
 NESTED = [
     "SELECT id FROM items WHERE id IN (SELECT id FROM other LIMIT 5) LIMIT 10 SEARCH PARAMS (ef=1)",
@@ -538,10 +667,9 @@ NESTED = [
     "SELECT CASE WHEN (SELECT COUNT(*) FROM o LIMIT 1) > 0 THEN 1 ELSE 0 END AS c FROM items LIMIT 10 SEARCH PARAMS (ef=1)",
     "SELECT id FROM items GROUP BY id HAVING COUNT(*) > (SELECT COUNT(*) FROM o LIMIT 1) LIMIT 10 SEARCH PARAMS (ef=1)",
     # Three levels of derived table, each with its own LIMIT, under both of our clauses at once.
-    # (HYBRID SEARCH precedes WHERE here because that is the order the generator emits -- see
-    # test_clause_order_strictness_is_one_sided.)
-    "SELECT id FROM items HYBRID SEARCH (e <=> :v WEIGHT 0.5, f <#> :w WEIGHT 0.5) RERANK RRF(k=60)"
+    "SELECT id FROM items"
     " WHERE id IN (SELECT id FROM (SELECT id FROM (SELECT id FROM w LIMIT 1) AS x LIMIT 2) AS y LIMIT 3)"
+    " HYBRID SEARCH (e <=> :v WEIGHT 0.5, f <#> :w WEIGHT 0.5) RERANK RRF(k=60)"
     " LIMIT 10 SEARCH PARAMS (ef=1)",
     # Inner queries carrying *our* clauses, which must not be attributed to the outer one.
     "SELECT id FROM (SELECT id FROM items LIMIT 5 SEARCH PARAMS (ef=1)) AS s LIMIT 10",
@@ -565,12 +693,69 @@ NESTED = [
 
 
 @pytest.mark.parametrize("sql", NESTED, ids=range(len(NESTED)))
-def test_nesting_never_triggers_a_spurious_clause_order_error(sql):
+def test_nesting_never_triggers_a_spurious_clause_order_error(sql) -> None:
     assert_stable(sql, (exp.Select, exp.Subquery))
 
 
+# A token-type scan cannot tell the LIMIT *clause* from the word "limit" used as a name. Every case
+# below parses in stock sqlglot and used to be rejected here with the factually false message
+# "HYBRID SEARCH must precede LIMIT", pointing at a LIMIT clause that is in the right place.
 @pytest.mark.parametrize(
-    "sql,message",
+    "sql",
+    [
+        "SELECT id FROM items WHERE limit = 1 HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT id FROM items WHERE items.limit = 1 HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT id FROM items ORDER BY limit HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT id FROM items WHERE a = :limit HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT limit AS x FROM items HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT id FROM items AS limit HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT id FROM items WHERE s = 'LIMIT' HYBRID SEARCH (e <=> :v) LIMIT 10",
+    ],
+    ids=[
+        "where",
+        "qualified",
+        "order-by",
+        "placeholder",
+        "alias",
+        "table-alias",
+        "literal",
+    ],
+)
+def test_an_identifier_named_limit_is_not_the_limit_clause(sql) -> None:
+    assert_stable(sql, exp.Select)
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        (
+            "SELECT id FROM items SEARCH PARAMS (ef=64) FETCH FIRST 10 ROWS ONLY",
+            "SEARCH PARAMS must follow LIMIT",
+        ),
+        (
+            "SELECT id FROM items FETCH FIRST 10 ROWS ONLY HYBRID SEARCH (e <=> :v)",
+            "HYBRID SEARCH must precede LIMIT",
+        ),
+    ],
+    ids=["params-before-fetch", "hybrid-after-fetch"],
+)
+def test_fetch_first_counts_as_the_limit_clause(sql, message) -> None:
+    # FETCH FIRST n ROWS ONLY fills the very same `limit` arg as LIMIT n, so D5 has to see it. A
+    # scan keyed on TokenType.LIMIT never did, and both violations were accepted and reordered.
+    with pytest.raises(ParseError, match=message):
+        parse(sql)
+
+
+def test_fetch_first_in_canonical_order_is_accepted() -> None:
+    assert_stable(
+        "SELECT id FROM items HYBRID SEARCH (e <=> :v) FETCH FIRST 10 ROWS ONLY"
+        " SEARCH PARAMS (ef=1)",
+        exp.Select,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
     [
         (
             "SELECT id FROM items SEARCH PARAMS (ef=1) LIMIT 10",
@@ -590,59 +775,99 @@ def test_nesting_never_triggers_a_spurious_clause_order_error(sql):
         ),
     ],
 )
-def test_top_level_clause_order_violations_are_still_rejected(sql, message):
+def test_top_level_clause_order_violations_are_still_rejected(
+    sql, message
+) -> None:
     with pytest.raises(ParseError, match=message):
         parse(sql)
 
 
 @pytest.mark.parametrize(
-    "sql,emitted",
+    "sql",
     [
-        (
-            "SELECT id FROM items WHERE a = 1 HYBRID SEARCH (e <=> :v) LIMIT 10",
-            "SELECT id FROM items HYBRID SEARCH (e <=> :v) WHERE a = 1 LIMIT 10",
-        ),
-        (
-            "SELECT id FROM items ORDER BY id HYBRID SEARCH (e <=> :v) LIMIT 10",
-            "SELECT id FROM items HYBRID SEARCH (e <=> :v) ORDER BY id LIMIT 10",
-        ),
-        (
-            "SELECT id FROM items LIMIT 10 SEARCH PARAMS (ef=1) OFFSET 5",
-            "SELECT id FROM items LIMIT 10 OFFSET 5 SEARCH PARAMS (ef=1)",
-        ),
+        "SELECT id FROM items WHERE a = 1 HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT id FROM items ORDER BY id HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT id FROM items JOIN o ON items.id = o.id HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT id FROM items GROUP BY id HAVING COUNT(*) > 1 HYBRID SEARCH (e <=> :v) LIMIT 10",
     ],
+    ids=["where", "order-by", "join", "group-having"],
 )
-def test_clause_order_strictness_is_one_sided(sql, emitted):
-    """FINDING 4. D5 says a violation must raise rather than be silently reordered, but the
-    validator only compares HYBRID SEARCH / SEARCH PARAMS / LIMIT against each other. Their order
-    relative to WHERE, ORDER BY and OFFSET is unchecked, so exactly the accept-then-rewrite
-    behaviour D5 forbids survives for those pairs. The AST is right; only the text moves."""
+def test_hybrid_search_is_emitted_where_it_was_written(sql) -> None:
+    """Resolves FINDING 4 for HYBRID SEARCH. The clause used to be appended into
+    ``query_modifiers``' ``*sqls``, which splices *before* joins/where/group/having -- so it came
+    out directly after FROM, a position no SQL surface has a clause in, and the input was silently
+    reordered on the way out. It now renders from ``offset_limit_modifiers``, i.e. immediately
+    before LIMIT, which is exactly where D5 says it belongs."""
+    assert_stable(sql, exp.Select)
+
+
+def test_clause_order_strictness_is_one_sided() -> None:
+    """What is left of FINDING 4: SEARCH PARAMS is emitted after OFFSET regardless of where it was
+    written, because ``after_limit_modifiers`` appends it last and the validator only compares our
+    clauses against LIMIT, never OFFSET. Accepted and reordered -- the AST is right, only the text
+    moves. Pinned rather than fixed: OFFSET is not part of D5's stated ordering."""
+    sql = "SELECT id FROM items LIMIT 10 SEARCH PARAMS (ef=1) OFFSET 5"
+    emitted = "SELECT id FROM items LIMIT 10 OFFSET 5 SEARCH PARAMS (ef=1)"
     assert parse(sql).sql("milvus") == emitted
-    assert parse(emitted).sql("milvus") == emitted  # the rewritten form is a fixed point
+    assert (
+        parse(emitted).sql("milvus") == emitted
+    )  # the rewritten form is a fixed point
     # repr() would differ purely because args are keyed in parse order, so compare per-clause.
     assert _clauses(parse(sql)) == _clauses(parse(emitted))
 
 
-def test_search_params_survives_a_set_operation_round_trip():
-    """FINDING 5. On a set operation the LIMIT binds to the exp.Union while SEARCH PARAMS binds to
-    the right-hand Select, and the Union generator emits the operand (with its after-limit
-    modifiers) before its own LIMIT. The result is text in the order the dialect itself rejects:
-    parse -> generate -> parse raises. This is the one place a legal input does not survive a
-    round trip."""
-    sql = "SELECT id FROM a UNION SELECT id FROM b LIMIT 10 SEARCH PARAMS (ef=1)"
-    emitted = parse(sql).sql("milvus")
-    assert emitted == "SELECT id FROM a UNION SELECT id FROM b SEARCH PARAMS (ef=1) LIMIT 10"
-    with pytest.raises(ParseError, match="SEARCH PARAMS must follow LIMIT"):
-        parse(emitted)
-
-
-@pytest.mark.xfail(
-    strict=True, reason="FINDING 5: union LIMIT and SEARCH PARAMS bind to different nodes"
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT id FROM a UNION SELECT id FROM b LIMIT 10 SEARCH PARAMS (ef=1)",
+        "SELECT a FROM t LIMIT 1 UNION SELECT b FROM u LIMIT 2 SEARCH PARAMS (x=1)",
+        "SELECT id FROM a UNION SELECT id FROM b HYBRID SEARCH (e <=> :v) LIMIT 10",
+        "SELECT id FROM a INTERSECT SELECT id FROM b LIMIT 10 SEARCH PARAMS (ef=1)",
+    ],
+    ids=["union", "union-both-limits", "union-hybrid", "intersect"],
 )
-def test_search_params_should_survive_a_set_operation_round_trip():
-    sql = "SELECT id FROM a UNION SELECT id FROM b LIMIT 10 SEARCH PARAMS (ef=1)"
-    out = parse(sql).sql("milvus")
-    assert repr(parse(out)) == repr(parse(sql))
+def test_search_params_survives_a_set_operation_round_trip(sql) -> None:
+    """Resolves FINDING 5. The trailing LIMIT is hoisted from the last branch onto the
+    ``exp.SetOperation`` by ``SET_OP_MODIFIERS``; while our two clauses were not in that set they
+    stayed on the branch, so the generator emitted the branch's SEARCH PARAMS *before* the union's
+    LIMIT -- output in the order this very dialect rejects. Parse, generate, re-parse used to
+    raise on text the user never wrote."""
+    ast = assert_stable(sql, exp.SetOperation)
+    assert ast.args.get(SEARCH_PARAMS_ARG) or ast.args.get(HYBRID_ARG)
+    assert not ast.expression.args.get(SEARCH_PARAMS_ARG)
+    assert not ast.expression.args.get(HYBRID_ARG)
+
+
+@pytest.mark.parametrize(
+    ("node", "key"),
+    [
+        (exp.Subquery, HYBRID_ARG),
+        (exp.Subquery, SEARCH_PARAMS_ARG),
+        (exp.SetOperation, HYBRID_ARG),
+        (exp.SetOperation, SEARCH_PARAMS_ARG),
+    ],
+    ids=["subquery-hybrid", "subquery-params", "setop-hybrid", "setop-params"],
+)
+def test_our_clauses_are_declared_on_every_node_they_can_land_on(
+    node, key
+) -> None:
+    # `this.set(key, ...)` in sqlglot's modifier loop bypasses validate_expression, so an
+    # undeclared arg was written anyway -- and then `key in node.arg_types` said it was not there,
+    # which is what made `Subquery.unnest().sql()` drop the clause without a word.
+    assert node.arg_types[key] is False
+
+
+def test_clauses_on_a_subquery_are_validated_and_preserved() -> None:
+    # BaseParser.MODIFIABLES lets a modifier attach to a Subquery exactly as to a Select, so D5
+    # has to hold there too; the old gate checked `isinstance(this, exp.Select)` and skipped it.
+    ast = assert_stable(
+        "(SELECT id FROM items) LIMIT 10 SEARCH PARAMS (ef=1)", exp.Subquery
+    )
+    assert isinstance(ast.args[SEARCH_PARAMS_ARG], SearchParams)
+    with pytest.raises(ParseError, match="SEARCH PARAMS must follow LIMIT"):
+        parse("(SELECT id FROM items) SEARCH PARAMS (ef=1) LIMIT 10")
+    with pytest.raises(ParseError, match="HYBRID SEARCH must precede LIMIT"):
+        parse("(SELECT id FROM items) LIMIT 10 HYBRID SEARCH (e <=> :v)")
 
 
 @pytest.mark.parametrize(
@@ -655,7 +880,7 @@ def test_search_params_should_survive_a_set_operation_round_trip():
         "CREATE TABLE x AS SELECT id FROM items HYBRID SEARCH (e <=> :v) LIMIT 10",
     ],
 )
-def test_our_modifiers_inside_other_statements(sql):
+def test_our_modifiers_inside_other_statements(sql) -> None:
     assert_stable(sql, (exp.Union, exp.Insert, exp.Create))
 
 
@@ -674,18 +899,21 @@ PARAMS_SQL = (
 )
 
 
-def test_the_arg_types_patch_leaves_ordinary_selects_alone():
+def test_the_arg_types_patch_leaves_ordinary_selects_alone() -> None:
     # exp.Select.arg_types is patched *globally*, so the two keys exist for every dialect. They
     # must stay optional and absent: a Select nobody asked to carry them must be byte-identical to
     # what stock sqlglot builds. (test_packaging.py pins the patch itself.)
     assert exp.Select.arg_types[HYBRID_ARG] is False
     assert exp.Select.arg_types[SEARCH_PARAMS_ARG] is False
     plain = exp.select("a").from_("t")
-    assert HYBRID_ARG not in plain.args and SEARCH_PARAMS_ARG not in plain.args
+    assert HYBRID_ARG not in plain.args
+    assert SEARCH_PARAMS_ARG not in plain.args
     assert plain.sql("postgres") == "SELECT a FROM t"
 
 
-@pytest.mark.parametrize("sql", [HYBRID_SQL, PARAMS_SQL], ids=["hybrid", "search-params"])
+@pytest.mark.parametrize(
+    "sql", [HYBRID_SQL, PARAMS_SQL], ids=["hybrid", "search-params"]
+)
 @pytest.mark.parametrize(
     "clone",
     [
@@ -696,14 +924,14 @@ def test_the_arg_types_patch_leaves_ordinary_selects_alone():
     ],
     ids=["copy", "deepcopy", "pickle", "serde"],
 )
-def test_custom_select_args_survive_cloning(sql, clone):
+def test_custom_select_args_survive_cloning(sql, clone) -> None:
     ast = parse(sql)
     clone_ = clone(ast)
     assert repr(clone_) == repr(ast)
     assert clone_.sql("milvus") == sql
 
 
-def test_copy_is_deep_for_custom_args():
+def test_copy_is_deep_for_custom_args() -> None:
     ast = parse(HYBRID_SQL)
     clone = ast.copy()
     assert clone.args[HYBRID_ARG] is not ast.args[HYBRID_ARG]
@@ -711,35 +939,45 @@ def test_copy_is_deep_for_custom_args():
     assert ast.sql("milvus") == HYBRID_SQL  # the original is untouched
 
 
-def test_walk_and_find_all_reach_inside_custom_args():
+def test_walk_and_find_all_reach_inside_custom_args() -> None:
     # If the custom args were stored anywhere other than exp.Select.args, traversal would silently
     # skip them and every optimizer rule, lineage query and Track B translator would miss them.
     ast = parse(HYBRID_SQL)
     assert len(list(ast.find_all(SearchArm))) == 2
     assert len(list(ast.find_all(CosineDistance))) == 1
     assert len(list(ast.find_all(InnerProduct))) == 1
-    assert [c.sql() for c in ast.find_all(exp.Column)] == ["id", "embedding", "sparse_emb"]
+    assert [c.sql() for c in ast.find_all(exp.Column)] == [
+        "id",
+        "embedding",
+        "sparse_emb",
+    ]
     assert [p.sql() for p in ast.find_all(exp.Placeholder)] == [":dv", ":sv"]
     assert all(node.parent is not None for node in ast.find_all(SearchArm))
     assert set(ast.walk()) >= set(ast.find_all(HybridSearch))
 
 
-SCHEMA = {"items": {"id": "BIGINT", "category": "VARCHAR", "embedding": "TEXT", "sparse_emb": "TEXT"}}
+SCHEMA = {
+    "items": {
+        "id": "BIGINT",
+        "category": "VARCHAR",
+        "embedding": "TEXT",
+        "sparse_emb": "TEXT",
+    }
+}
 
 
 @pytest.mark.parametrize(
-    "sql,clause,qualified",
+    ("sql", "clause", "qualified"),
     [
         (HYBRID_SQL, HYBRID_ARG, '"items"."embedding" <=> :dv'),
         (PARAMS_SQL, SEARCH_PARAMS_ARG, "SEARCH PARAMS (ef_search=64)"),
     ],
     ids=["hybrid", "search-params"],
 )
-@pytest.mark.parametrize("rule", ["qualify", "optimize"], ids=["qualify", "optimize"])
-def test_optimizer_preserves_custom_args(sql, clause, qualified, rule):
-    from sqlglot.optimizer import optimize
-    from sqlglot.optimizer.qualify import qualify
-
+@pytest.mark.parametrize(
+    "rule", ["qualify", "optimize"], ids=["qualify", "optimize"]
+)
+def test_optimizer_preserves_custom_args(sql, clause, qualified, rule) -> None:
     rewritten = (qualify if rule == "qualify" else optimize)(
         parse(sql), schema=SCHEMA, dialect="milvus"
     )
@@ -751,14 +989,59 @@ def test_optimizer_preserves_custom_args(sql, clause, qualified, rule):
     assert parse(out).sql("milvus") == out
 
 
+# =================================================================================================
+# 8b. Identifier case
+# =================================================================================================
+#
+# Spec §1.3: Milvus is case-sensitive about collection and field names, so `items` and `Items` are
+# different objects. The dialect inherited sqlglot's LOWERCASE default, under which the optimizer
+# silently retargeted a query at a collection that may not exist -- no error, wrong rows.
+
+
+def test_the_dialect_is_case_sensitive() -> None:
+    assert (
+        Milvus.NORMALIZATION_STRATEGY is NormalizationStrategy.CASE_SENSITIVE
+    )
+
+
 @pytest.mark.parametrize(
-    "write,expected",
+    "sql",
+    [
+        "SELECT Id FROM Items",
+        'SELECT "Id" FROM "Items"',
+        "SELECT Id, Category FROM Items WHERE Category = :cat",
+        "CREATE TABLE Items (Id BIGINT)",
+    ],
+)
+def test_identifier_case_is_never_normalised(sql) -> None:
+
+    assert (
+        normalize_identifiers(parse(sql), dialect="milvus").sql("milvus")
+        == sql
+    )
+
+
+def test_qualify_does_not_retarget_a_query_at_a_different_collection() -> None:
+    # The concrete harm: `Items` and `items` are two collections, and the lower-casing default
+    # rewrote a query against one into a query against the other while reporting success.
+    out = qualify(
+        parse("SELECT Id FROM Items"),
+        schema={"Items": {"Id": "BIGINT"}},
+        dialect="milvus",
+    ).sql("milvus")
+    assert out == 'SELECT "Items"."Id" AS "Id" FROM "Items" AS "Items"'
+
+
+@pytest.mark.parametrize(
+    ("write", "expected"),
     [
         ("postgres", "SELECT id FROM items LIMIT 10"),
         ("duckdb", "SELECT id FROM items LIMIT 10"),
     ],
 )
-def test_search_params_is_dropped_without_warning_when_writing_other_dialects(write, expected):
+def test_search_params_is_dropped_without_warning_when_writing_other_dialects(
+    write, expected
+) -> None:
     """FINDING 6. Foreign generators never call after_limit_modifiers, so SEARCH PARAMS vanishes
     silently -- while a CosineDistance in the same query raises ValueError. Nothing here is a
     regression in *base* SQL, but the asymmetry means milvus -> postgres can quietly return the
@@ -783,33 +1066,81 @@ def test_search_params_is_dropped_without_warning_when_writing_other_dialects(wr
         "CREATE INDEX idx_emb ON items (embedding) USING HNSW WITH (metric_type='COSINE', M=16)",
     ],
 )
-def test_create_index_still_round_trips(sql):
+def test_create_index_still_round_trips(sql) -> None:
     assert_stable(sql, exp.Create)
 
 
-def test_create_index_accepts_pgvector_word_order():
+def test_create_index_accepts_pgvector_word_order() -> None:
     ast = parse("CREATE INDEX i ON items USING hnsw (embedding)")
-    assert ast.sql("milvus") == "CREATE INDEX i ON items (embedding) USING HNSW"
+    assert (
+        ast.sql("milvus") == "CREATE INDEX i ON items (embedding) USING HNSW"
+    )
     assert not isinstance(ast, exp.Command)
 
 
-def test_partial_index_predicate_is_parsed_then_dropped():
+def test_partial_index_predicate_is_dropped_but_no_longer_silently() -> None:
     """FINDING 7. _parse_index_params captures `where`, but the Milvus indexparameters_sql only
-    renders columns/using/with_storage. A partial index therefore silently widens to the whole
-    table -- the AST holds the predicate, the SQL does not. Same override also loses `include`,
-    `partition_by` and `tablespace`."""
+    renders columns/using/with_storage, so a partial index widens to the whole table -- the AST
+    holds the predicate, the SQL does not. MilvusQL has no partial-index syntax to render it in,
+    so the loss stands; what changed is that it is now reported, exactly like the <=> guard, rather
+    than happening in silence even under unsupported_level=RAISE."""
     ast = parse("CREATE INDEX i ON items (a) WHERE a > 1")
     assert ast.find(exp.IndexParameters).args["where"].sql() == "WHERE a > 1"
     assert ast.sql("milvus") == "CREATE INDEX i ON items (a)"
     assert ast.sql("postgres") == "CREATE INDEX i ON items(a) WHERE a > 1"
+    with pytest.raises(
+        UnsupportedError, match="MilvusQL indexes do not support WHERE"
+    ):
+        ast.sql("milvus", unsupported_level=ErrorLevel.RAISE)
 
 
-@pytest.mark.xfail(strict=True, reason="FINDING 7: indexparameters_sql drops IndexParameters.where")
-def test_partial_index_predicate_should_round_trip():
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("where", exp.Where(this=exp.condition("a > 1"))),
+        ("include", [exp.column("d")]),
+        ("partition_by", [exp.column("d")]),
+        ("tablespace", "ts"),
+        ("on", exp.column("x")),
+    ],
+)
+def test_every_dropped_index_argument_is_reported(key, value) -> None:
+    # indexparameters_sql rebuilds the clause from three args and discards the rest. Each arg is
+    # set on the node directly rather than via some front end: postgres cannot even parse an index
+    # TABLESPACE, but sqlglot models it, so anything handing us a node is a live source.
+    ast = parse("CREATE INDEX i ON items (a) USING HNSW")
+    ast.find(exp.IndexParameters).set(key, value)
+    assert (
+        ast.sql("milvus") == "CREATE INDEX i ON items (a) USING HNSW"
+    )  # dropped either way
+    with pytest.raises(
+        UnsupportedError, match=f"do not support {key.upper()}"
+    ):
+        ast.sql("milvus", unsupported_level=ErrorLevel.RAISE)
+
+
+def test_pgvector_index_include_is_reported_rather_than_dropped() -> None:
+    # The postgres front end really does produce this shape, and INCLUDE is the arg most likely to
+    # arrive from a real migration.
+    ast = parse(
+        "CREATE INDEX i ON t USING btree (c) INCLUDE (d)", dialect="postgres"
+    )
+    assert ast.sql("milvus") == "CREATE INDEX i ON t (c) USING BTREE"
+    with pytest.raises(UnsupportedError, match="do not support INCLUDE"):
+        ast.sql("milvus", unsupported_level=ErrorLevel.RAISE)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="FINDING 7: MilvusQL has no partial-index syntax, so indexparameters_sql still drops "
+    "IndexParameters.where -- it now reports the loss as unsupported instead of hiding it, but "
+    "the text cannot round-trip until the language grows a WHERE for CREATE INDEX.",
+)
+def test_partial_index_predicate_should_round_trip() -> None:
     assert_stable("CREATE INDEX i ON items (a) WHERE a > 1", exp.Create)
 
 
-def test_index_include_degrades_to_a_command():
+def test_index_include_degrades_to_a_command() -> None:
     """FINDING 8. The D6 branch fires on any `(` after the table name and then only understands
     USING/WITH/WHERE, so INCLUDE -- which stock sqlglot parses fine -- falls off the end and the
     whole statement degrades to an opaque exp.Command."""
@@ -818,8 +1149,10 @@ def test_index_include_degrades_to_a_command():
     assert isinstance(sqlglot.parse_one(sql, read="milvus"), exp.Command)
 
 
-@pytest.mark.xfail(strict=True, reason="FINDING 8: the D6 branch does not handle INCLUDE")
-def test_index_include_should_parse():
+@pytest.mark.xfail(
+    strict=True, reason="FINDING 8: the D6 branch does not handle INCLUDE"
+)
+def test_index_include_should_parse() -> None:
     assert_stable("CREATE INDEX i ON items (a) INCLUDE (b)", exp.Create)
 
 
@@ -847,7 +1180,12 @@ SPEC_STATEMENTS = [
         ),
         ("load-table", "LOAD TABLE items WITH (replicas=2)", LoadTable, 0),
         ("release-table", "RELEASE TABLE items", ReleaseTable, 0),
-        ("insert", "INSERT INTO items (embedding, category) VALUES (:emb, :cat)", exp.Insert, 0),
+        (
+            "insert",
+            "INSERT INTO items (embedding, category) VALUES (:emb, :cat)",
+            exp.Insert,
+            0,
+        ),
         ("delete", "DELETE FROM items WHERE category = :cat", exp.Delete, 1),
         (
             "vector-search",
@@ -870,20 +1208,25 @@ SPEC_STATEMENTS = [
             exp.Select,
             3,
         ),
-        ("alter-add-field", "ALTER TABLE items ADD FIELD tag VARCHAR(32)", exp.Alter, 0),
+        (
+            "alter-add-field",
+            "ALTER TABLE items ADD FIELD tag VARCHAR(32)",
+            exp.Alter,
+            0,
+        ),
     ]
 ]
 
 
-@pytest.mark.parametrize("sql,node,columns", SPEC_STATEMENTS)
-def test_spec_statements_are_not_opaque_blobs(sql, node, columns):
+@pytest.mark.parametrize(("sql", "node", "columns"), SPEC_STATEMENTS)
+def test_spec_statements_are_not_opaque_blobs(sql, node, columns) -> None:
     # The trap in one test: an exp.Command round-trips byte-identically while containing nothing,
     # so the round trip alone proves nothing. Pin the node type and the column count too.
     ast = assert_stable(sql, node)
     assert len(list(ast.find_all(exp.Column))) == columns
 
 
-def test_statements_can_be_parsed_in_a_single_script():
+def test_statements_can_be_parsed_in_a_single_script() -> None:
     # Each statement gets its own token slice, so the validator's absolute token indices must be
     # slice-relative. A script is the cheapest way to prove they are.
     statements = sqlglot.parse(
@@ -909,7 +1252,7 @@ def test_statements_can_be_parsed_in_a_single_script():
         "ALTER TABLE t ALTER COLUMN a SET DEFAULT 1",
     ],
 )
-def test_alter_parsers_override_still_delegates(sql):
+def test_alter_parsers_override_still_delegates(sql) -> None:
     # ALTER_PARSERS["ADD"] is replaced wholesale; everything that is not `ADD FIELD` must reach
     # the base implementation unchanged.
     assert behaviour(sql, "milvus") == behaviour(sql, None)

@@ -22,7 +22,12 @@ from __future__ import annotations
 import pytest
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ErrorLevel, ParseError, SqlglotError, UnsupportedError
+from sqlglot.errors import (
+    ErrorLevel,
+    ParseError,
+    SqlglotError,
+    UnsupportedError,
+)
 
 from sqlglot_milvus import CosineDistance, InnerProduct, L1Distance
 
@@ -182,23 +187,28 @@ PGVECTOR_CASES = [
 
 
 @pytest.mark.parametrize(
-    "postgres_sql, milvus_sql, node_type",
+    ("postgres_sql", "milvus_sql", "node_type"),
     [case[1:] for case in PGVECTOR_CASES],
     ids=[case[0] for case in PGVECTOR_CASES],
 )
-def test_pgvector_transpiles_to_milvus(postgres_sql, milvus_sql, node_type):
+def test_pgvector_transpiles_to_milvus(
+    postgres_sql, milvus_sql, node_type
+) -> None:
     assert to_milvus(postgres_sql, read="postgres") == milvus_sql
     assert_is_real_milvus(milvus_sql, node_type)
 
 
 @pytest.mark.parametrize(
-    "postgres_sql, milvus_sql",
+    ("postgres_sql", "milvus_sql"),
     [
         # psycopg "format" paramstyle -- by far the most common in pgvector-python examples.
         # It carries no name, so it lands on the anonymous exp.Placeholder and comes out as "?".
         ("SELECT x FROM t WHERE c = %s", "SELECT x FROM t WHERE c = ?"),
         # psycopg "pyformat" paramstyle: named, and maps straight onto MilvusQL's :name.
-        ("SELECT x FROM t WHERE c = %(emb)s", "SELECT x FROM t WHERE c = :emb"),
+        (
+            "SELECT x FROM t WHERE c = %(emb)s",
+            "SELECT x FROM t WHERE c = :emb",
+        ),
         # asyncpg's numeric style is NOT a Placeholder in sqlglot -- postgres parses $1 as
         # exp.Parameter, which the milvus generator renders with the @ sigil. It re-parses as a
         # Parameter under milvus, so the round trip is lossless, but the *spelling* changes.
@@ -206,15 +216,48 @@ def test_pgvector_transpiles_to_milvus(postgres_sql, milvus_sql, node_type):
     ],
     ids=["format-%s", "pyformat-%(name)s", "numeric-$1"],
 )
-def test_pgvector_placeholder_styles(postgres_sql, milvus_sql):
+def test_pgvector_placeholder_styles(postgres_sql, milvus_sql) -> None:
     assert to_milvus(postgres_sql, read="postgres") == milvus_sql
     assert_is_real_milvus(milvus_sql, exp.Select)
     # ...and back again, unchanged: the paramstyle mapping is a bijection in both directions.
-    ast = sqlglot.parse_one(milvus_sql, read="milvus", error_level=ErrorLevel.RAISE)
-    assert ast.sql(dialect="postgres", unsupported_level=ErrorLevel.RAISE) == postgres_sql
+    ast = sqlglot.parse_one(
+        milvus_sql, read="milvus", error_level=ErrorLevel.RAISE
+    )
+    assert (
+        ast.sql(dialect="postgres", unsupported_level=ErrorLevel.RAISE)
+        == postgres_sql
+    )
 
 
-def test_transpiled_index_keeps_a_structured_ast():
+@pytest.mark.parametrize(
+    ("postgres_sql", "milvus_sql", "bindable"),
+    [
+        (
+            "SELECT x FROM t WHERE c = %(emb)s",
+            "SELECT x FROM t WHERE c = :emb",
+            True,
+        ),
+        ("SELECT x FROM t WHERE c = %s", "SELECT x FROM t WHERE c = ?", False),
+    ],
+    ids=["pyformat-is-bindable", "format-is-not"],
+)
+def test_only_a_named_parameter_survives_the_migration_bindable(
+    postgres_sql, milvus_sql, bindable
+) -> None:
+    """MilvusQL's spec (§1.2) and Track B's cursor both say named-only, and the README said so
+    flatly -- while the README's own migration snippet used psycopg's positional ``%s`` and
+    produced a nameless ``?`` that a ``paramstyle="named"`` cursor can never bind.
+
+    Neither behaviour is wrong on its own; the pairing was. The output is pinned here *together
+    with whether it can actually be bound*, so the documented rewrite step cannot go missing again.
+    """
+    out = to_milvus(postgres_sql, read="postgres")
+    assert out == milvus_sql
+    placeholder = assert_is_real_milvus(out, exp.Select).find(exp.Placeholder)
+    assert bool(placeholder.this) is bindable
+
+
+def test_transpiled_index_keeps_a_structured_ast() -> None:
     """The index cases above are exactly where a Command blob would hide.
 
     ``CREATE INDEX ... USING HNSW`` is unusual enough that a dialect which never implemented it
@@ -232,7 +275,7 @@ def test_transpiled_index_keeps_a_structured_ast():
     assert [c.name for c in ast.find_all(exp.Column)] == ["embedding"]
 
 
-def test_pgvector_opclass_is_carried_through_verbatim():
+def test_pgvector_opclass_is_carried_through_verbatim() -> None:
     """FINDING: ``vector_l2_ops`` survives into MilvusQL output as a meaningless operator class.
 
     pgvector encodes the metric in the opclass; Milvus encodes it in ``metric_type`` inside the
@@ -241,9 +284,12 @@ def test_pgvector_opclass_is_carried_through_verbatim():
     maps ``vector_l2_ops -> metric_type='L2'``, so a migration tool has to do it.
     """
     out = to_milvus(
-        "CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops)", read="postgres"
+        "CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops)",
+        read="postgres",
     )
-    assert out == "CREATE INDEX ON items (embedding vector_cosine_ops) USING HNSW"
+    assert (
+        out == "CREATE INDEX ON items (embedding vector_cosine_ops) USING HNSW"
+    )
 
     ast = assert_is_real_milvus(out, exp.Create)
     assert ast.find(exp.Opclass) is not None
@@ -254,28 +300,29 @@ def test_pgvector_opclass_is_carried_through_verbatim():
 # 2. D6 -- both index word orders parse, output normalizes to MilvusQL order
 # ------------------------------------------------------------------------------------------
 
-MILVUS_ORDER = (
-    "CREATE INDEX idx_emb ON items (embedding) USING HNSW WITH (metric_type='COSINE', M=16)"
-)
-PGVECTOR_ORDER = (
-    "CREATE INDEX idx_emb ON items USING HNSW (embedding) WITH (metric_type='COSINE', M=16)"
-)
+MILVUS_ORDER = "CREATE INDEX idx_emb ON items (embedding) USING HNSW WITH (metric_type='COSINE', M=16)"
+PGVECTOR_ORDER = "CREATE INDEX idx_emb ON items USING HNSW (embedding) WITH (metric_type='COSINE', M=16)"
 
 
 @pytest.mark.parametrize(
-    "sql", [MILVUS_ORDER, PGVECTOR_ORDER], ids=["milvus-order", "pgvector-order"]
+    "sql",
+    [MILVUS_ORDER, PGVECTOR_ORDER],
+    ids=["milvus-order", "pgvector-order"],
 )
-def test_both_index_orders_normalize_to_milvus_order(sql):
+def test_both_index_orders_normalize_to_milvus_order(sql) -> None:
     # Without D6 the pgvector order degrades to exp.Command -- which re-renders byte-identically,
     # so the text assertion below would pass on its own. The type assertions are what test D6.
     ast = sqlglot.parse_one(sql, read="milvus", error_level=ErrorLevel.RAISE)
     assert not isinstance(ast, exp.Command)
     assert isinstance(ast, exp.Create)
     assert [c.name for c in ast.find_all(exp.Column)] == ["embedding"]
-    assert ast.sql(dialect="milvus", unsupported_level=ErrorLevel.RAISE) == MILVUS_ORDER
+    assert (
+        ast.sql(dialect="milvus", unsupported_level=ErrorLevel.RAISE)
+        == MILVUS_ORDER
+    )
 
 
-def test_both_index_orders_produce_the_same_ast():
+def test_both_index_orders_produce_the_same_ast() -> None:
     # Not just the same text: the same tree. Accepting pgvector's order is only useful if the
     # result is indistinguishable from natively-written MilvusQL downstream.
     assert repr(sqlglot.parse_one(MILVUS_ORDER, read="milvus")) == repr(
@@ -283,13 +330,21 @@ def test_both_index_orders_produce_the_same_ast():
     )
 
 
-def test_index_method_is_uppercased_on_output_not_on_parse():
+def test_index_method_is_uppercased_on_output_not_on_parse() -> None:
     # The generator upper()s the method name, so lowercase "hnsw" input still yields "USING HNSW".
     # The parsed AST keeps the source spelling, which is why AST comparisons must use one casing.
-    lower = sqlglot.parse_one("CREATE INDEX i ON t USING hnsw (e)", read="milvus")
-    upper = sqlglot.parse_one("CREATE INDEX i ON t USING HNSW (e)", read="milvus")
+    lower = sqlglot.parse_one(
+        "CREATE INDEX i ON t USING hnsw (e)", read="milvus"
+    )
+    upper = sqlglot.parse_one(
+        "CREATE INDEX i ON t USING HNSW (e)", read="milvus"
+    )
     normalized = "CREATE INDEX i ON t (e) USING HNSW"
-    assert lower.sql(dialect="milvus") == upper.sql(dialect="milvus") == normalized
+    assert (
+        lower.sql(dialect="milvus")
+        == upper.sql(dialect="milvus")
+        == normalized
+    )
     assert repr(lower) != repr(upper)
 
 
@@ -298,7 +353,7 @@ def test_index_method_is_uppercased_on_output_not_on_parse():
 # ------------------------------------------------------------------------------------------
 
 
-def test_mysql_null_safe_eq_raises_when_written_to_milvus():
+def test_mysql_null_safe_eq_raises_when_written_to_milvus() -> None:
     with pytest.raises(UnsupportedError, match="cosine distance"):
         sqlglot.transpile(
             "SELECT * FROM t WHERE a <=> b",
@@ -308,22 +363,32 @@ def test_mysql_null_safe_eq_raises_when_written_to_milvus():
         )
 
 
-def test_mysql_null_safe_eq_never_emits_the_operator_at_the_default_level():
+def test_mysql_null_safe_eq_never_emits_the_operator_at_the_default_level() -> (
+    None
+):
     # transpile() defaults to ErrorLevel.WARN, i.e. it logs and keeps going. What matters is that
     # the fallback is unambiguous: emitting "<=>" here would turn a null check into a vector search
     # with no diagnostic anywhere.
-    (out,) = sqlglot.transpile("SELECT * FROM t WHERE a <=> b", read="mysql", write="milvus")
+    (out,) = sqlglot.transpile(
+        "SELECT * FROM t WHERE a <=> b", read="mysql", write="milvus"
+    )
     assert out == "SELECT * FROM t WHERE a IS NOT DISTINCT FROM b"
     assert "<=>" not in out
 
 
-def test_the_two_dialects_genuinely_disagree_about_the_operator():
+def test_the_two_dialects_genuinely_disagree_about_the_operator() -> None:
     """The accepted cost of D3, stated as an assertion so nobody "fixes" it by accident."""
-    assert isinstance(sqlglot.parse_one("SELECT a <=> b", read="milvus").selects[0], CosineDistance)
-    assert isinstance(sqlglot.parse_one("SELECT a <=> b", read="mysql").selects[0], exp.NullSafeEQ)
+    assert isinstance(
+        sqlglot.parse_one("SELECT a <=> b", read="milvus").selects[0],
+        CosineDistance,
+    )
+    assert isinstance(
+        sqlglot.parse_one("SELECT a <=> b", read="mysql").selects[0],
+        exp.NullSafeEQ,
+    )
 
 
-def test_cosine_distance_has_no_rendering_in_foreign_dialects():
+def test_cosine_distance_has_no_rendering_in_foreign_dialects() -> None:
     """The reverse direction of the same collision, and it fails *loudly* -- but with a ValueError.
 
     sqlglot raises ``ValueError`` for a node with no TRANSFORMS entry, and ``ValueError`` is not a
@@ -345,7 +410,7 @@ def test_cosine_distance_has_no_rendering_in_foreign_dialects():
     ["<#>", "<+>"],
     ids=["inner-product", "l1"],
 )
-def test_postgres_cannot_parse_pgvector_ip_and_l1_operators(operator):
+def test_postgres_cannot_parse_pgvector_ip_and_l1_operators(operator) -> None:
     """FINDING: only ``<->`` makes it through ``read="postgres"``.
 
     sqlglot's postgres tokenizer has no pgvector support: ``<#>`` collides with the JSONB path
@@ -360,7 +425,9 @@ def test_postgres_cannot_parse_pgvector_ip_and_l1_operators(operator):
         )
 
 
-def test_postgres_reads_pgvector_cosine_distance_as_null_safe_equality():
+def test_postgres_reads_pgvector_cosine_distance_as_null_safe_equality() -> (
+    None
+):
     """FINDING: the single most common pgvector query cannot be transpiled from postgres.
 
     ``ORDER BY embedding <=> %s`` is *the* cosine-similarity query (it is what every OpenAI
@@ -385,17 +452,26 @@ def test_postgres_reads_pgvector_cosine_distance_as_null_safe_equality():
 
 
 @pytest.mark.parametrize(
-    "operator, node_type",
-    [("<->", exp.Distance), ("<=>", CosineDistance), ("<#>", InnerProduct), ("<+>", L1Distance)],
+    ("operator", "node_type"),
+    [
+        ("<->", exp.Distance),
+        ("<=>", CosineDistance),
+        ("<#>", InnerProduct),
+        ("<+>", L1Distance),
+    ],
     ids=["l2", "cosine", "inner-product", "l1"],
 )
-def test_milvus_reader_handles_raw_pgvector_text_for_all_four_operators(operator, node_type):
+def test_milvus_reader_handles_raw_pgvector_text_for_all_four_operators(
+    operator, node_type
+) -> None:
     """The workaround for the two findings above: read pgvector SQL with ``read="milvus"``.
 
     MilvusQL borrows pgvector's operator spellings exactly, so pgvector source text parses directly
     -- and correctly, including the two operators postgres chokes on and the one it mis-reads.
     """
-    sql = f"SELECT * FROM items ORDER BY embedding {operator} '[3,1,2]' LIMIT 5"
+    sql = (
+        f"SELECT * FROM items ORDER BY embedding {operator} '[3,1,2]' LIMIT 5"
+    )
     ast = assert_is_real_milvus(sql, exp.Select)
     assert isinstance(ast.args["order"].expressions[0].this, node_type)
 
@@ -446,18 +522,30 @@ SHARED_SUBSET = [
 
 
 @pytest.mark.parametrize(
-    "milvus_sql, postgres_sql, duckdb_sql",
+    ("milvus_sql", "postgres_sql", "duckdb_sql"),
     [case[1:] for case in SHARED_SUBSET],
     ids=[case[0] for case in SHARED_SUBSET],
 )
-def test_milvus_transpiles_to_postgres_and_duckdb(milvus_sql, postgres_sql, duckdb_sql):
-    ast = sqlglot.parse_one(milvus_sql, read="milvus", error_level=ErrorLevel.RAISE)
-    assert ast.sql(dialect="postgres", unsupported_level=ErrorLevel.RAISE) == postgres_sql
-    assert ast.sql(dialect="duckdb", unsupported_level=ErrorLevel.RAISE) == duckdb_sql
+def test_milvus_transpiles_to_postgres_and_duckdb(
+    milvus_sql, postgres_sql, duckdb_sql
+) -> None:
+    ast = sqlglot.parse_one(
+        milvus_sql, read="milvus", error_level=ErrorLevel.RAISE
+    )
+    assert (
+        ast.sql(dialect="postgres", unsupported_level=ErrorLevel.RAISE)
+        == postgres_sql
+    )
+    assert (
+        ast.sql(dialect="duckdb", unsupported_level=ErrorLevel.RAISE)
+        == duckdb_sql
+    )
 
     # Sanity: the emitted SQL is readable by the dialect it claims to be written in.
     for sql, dialect in ((postgres_sql, "postgres"), (duckdb_sql, "duckdb")):
-        out = sqlglot.parse_one(sql, read=dialect, error_level=ErrorLevel.RAISE)
+        out = sqlglot.parse_one(
+            sql, read=dialect, error_level=ErrorLevel.RAISE
+        )
         assert not isinstance(out, exp.Command)
 
 
@@ -468,7 +556,7 @@ def test_milvus_transpiles_to_postgres_and_duckdb(milvus_sql, postgres_sql, duck
 
 @pytest.mark.parametrize("write", ["postgres", "duckdb"])
 @pytest.mark.parametrize(
-    "milvus_sql, expected",
+    ("milvus_sql", "expected"),
     [
         (
             "SELECT id FROM items HYBRID SEARCH "
@@ -483,7 +571,9 @@ def test_milvus_transpiles_to_postgres_and_duckdb(milvus_sql, postgres_sql, duck
     ],
     ids=["hybrid-search", "search-params"],
 )
-def test_milvus_only_select_clauses_are_silently_dropped(milvus_sql, expected, write):
+def test_milvus_only_select_clauses_are_silently_dropped(
+    milvus_sql, expected, write
+) -> None:
     """FINDING (data loss): ``HYBRID SEARCH`` and ``SEARCH PARAMS`` vanish without a diagnostic.
 
     Both clauses live as extra keys in ``exp.Select.args``, rendered by the *milvus* generator's
@@ -496,15 +586,23 @@ def test_milvus_only_select_clauses_are_silently_dropped(milvus_sql, expected, w
     This is worth stating loudly: it is silent semantic corruption in the one direction where a
     user is least likely to re-read the output (exporting MilvusQL to a "normal" database).
     """
-    ast = sqlglot.parse_one(milvus_sql, read="milvus", error_level=ErrorLevel.RAISE)
+    ast = sqlglot.parse_one(
+        milvus_sql, read="milvus", error_level=ErrorLevel.RAISE
+    )
     assert ast.args.get("hybrid") or ast.args.get("search_params")
 
-    generator = sqlglot.Dialect.get_or_raise(write).generator(unsupported_level=ErrorLevel.WARN)
+    generator = sqlglot.Dialect.get_or_raise(write).generator(
+        unsupported_level=ErrorLevel.WARN
+    )
     assert generator.generate(ast) == expected
-    assert generator.unsupported_messages == []  # nothing was reported. that is the finding.
+    assert (
+        generator.unsupported_messages == []
+    )  # nothing was reported. that is the finding.
 
     # Even the strictest setting stays quiet.
-    assert ast.sql(dialect=write, unsupported_level=ErrorLevel.RAISE) == expected
+    assert (
+        ast.sql(dialect=write, unsupported_level=ErrorLevel.RAISE) == expected
+    )
 
 
 @pytest.mark.parametrize("write", ["postgres", "duckdb"])
@@ -518,22 +616,33 @@ def test_milvus_only_select_clauses_are_silently_dropped(milvus_sql, expected, w
         "SELECT id FROM items ORDER BY embedding <#> :q LIMIT 10",
         "SELECT id FROM items ORDER BY embedding <+> :q LIMIT 10",
     ],
-    ids=["load-table", "release-table", "add-field", "cosine", "inner-product", "l1"],
+    ids=[
+        "load-table",
+        "release-table",
+        "add-field",
+        "cosine",
+        "inner-product",
+        "l1",
+    ],
 )
-def test_milvus_only_nodes_fail_loudly_but_with_a_plain_valueerror(milvus_sql, write):
+def test_milvus_only_nodes_fail_loudly_but_with_a_plain_valueerror(
+    milvus_sql, write
+) -> None:
     """Custom *nodes* do fail on foreign generators -- unlike the custom Select args above.
 
     The exception is ``ValueError``, which is deliberately pinned here because it is **not** a
     ``SqlglotError``: code that wraps transpilation in ``except SqlglotError`` will let it through,
     and ``unsupported_level=IGNORE`` will not suppress it.
     """
-    ast = sqlglot.parse_one(milvus_sql, read="milvus", error_level=ErrorLevel.RAISE)
+    ast = sqlglot.parse_one(
+        milvus_sql, read="milvus", error_level=ErrorLevel.RAISE
+    )
     with pytest.raises(ValueError) as excinfo:
         ast.sql(dialect=write, unsupported_level=ErrorLevel.IGNORE)
     assert not isinstance(excinfo.value, SqlglotError)
 
 
-def test_milvus_full_text_search_degrades_differently_per_dialect():
+def test_milvus_full_text_search_degrades_differently_per_dialect() -> None:
     """MATCH ... AGAINST has a postgres analogue; BM25_SCORE does not and passes through unchecked.
 
     Pinned rather than endorsed: ``@@`` against a bare placeholder is not valid postgres full-text
@@ -556,7 +665,9 @@ def test_milvus_full_text_search_degrades_differently_per_dialect():
     )
 
 
-def test_create_table_properties_survive_to_postgres_but_not_to_duckdb():
+def test_create_table_properties_survive_to_postgres_but_not_to_duckdb() -> (
+    None
+):
     """MilvusQL's table properties are the one place a foreign generator *does* complain."""
     sql = (
         "CREATE TABLE items (id BIGINT PRIMARY KEY AUTO_INCREMENT, embedding VECTOR(768)) "
@@ -589,13 +700,20 @@ def test_create_table_properties_survive_to_postgres_but_not_to_duckdb():
     ],
     ids=["filtered", "l2-search", "group-by"],
 )
-def test_milvus_postgres_milvus_round_trip_is_lossless(milvus_sql):
-    ast = sqlglot.parse_one(milvus_sql, read="milvus", error_level=ErrorLevel.RAISE)
-    postgres_sql = ast.sql(dialect="postgres", unsupported_level=ErrorLevel.RAISE)
+def test_milvus_postgres_milvus_round_trip_is_lossless(milvus_sql) -> None:
+    ast = sqlglot.parse_one(
+        milvus_sql, read="milvus", error_level=ErrorLevel.RAISE
+    )
+    postgres_sql = ast.sql(
+        dialect="postgres", unsupported_level=ErrorLevel.RAISE
+    )
 
     # The intermediate really is postgres, not our own text handed back unexamined.
     assert not isinstance(
-        sqlglot.parse_one(postgres_sql, read="postgres", error_level=ErrorLevel.RAISE), exp.Command
+        sqlglot.parse_one(
+            postgres_sql, read="postgres", error_level=ErrorLevel.RAISE
+        ),
+        exp.Command,
     )
     assert to_milvus(postgres_sql, read="postgres") == milvus_sql
 
@@ -609,7 +727,12 @@ def test_milvus_postgres_milvus_round_trip_is_lossless(milvus_sql):
     ],
     ids=["format-param", "named-param", "aliased-distance"],
 )
-def test_postgres_milvus_postgres_round_trip_is_lossless(postgres_sql):
+def test_postgres_milvus_postgres_round_trip_is_lossless(postgres_sql) -> None:
     milvus_sql = to_milvus(postgres_sql, read="postgres")
-    back = sqlglot.parse_one(milvus_sql, read="milvus", error_level=ErrorLevel.RAISE)
-    assert back.sql(dialect="postgres", unsupported_level=ErrorLevel.RAISE) == postgres_sql
+    back = sqlglot.parse_one(
+        milvus_sql, read="milvus", error_level=ErrorLevel.RAISE
+    )
+    assert (
+        back.sql(dialect="postgres", unsupported_level=ErrorLevel.RAISE)
+        == postgres_sql
+    )
