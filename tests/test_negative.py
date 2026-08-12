@@ -837,10 +837,14 @@ def test_known_wart_index_method_case_is_normalized_at_generation_not_at_parse()
     is to fold the case in ``_parse_index_params`` so parse and generate agree.
     """
     ast = parse("CREATE INDEX i ON items USING hnsw (embedding)")
-    assert ast.find(exp.IndexParameters).args["using"].name == "hnsw"
+    index_params = ast.find(exp.IndexParameters)
+    assert index_params is not None
+    assert index_params.args["using"].name == "hnsw"
 
     out = ast.sql(dialect="milvus", unsupported_level=ErrorLevel.RAISE)
-    assert parse(out).find(exp.IndexParameters).args["using"].name == "HNSW"
+    out_index_params = parse(out).find(exp.IndexParameters)
+    assert out_index_params is not None
+    assert out_index_params.args["using"].name == "HNSW"
     assert repr(parse(out)) != repr(ast)
 
 

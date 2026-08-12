@@ -901,6 +901,7 @@ def test_scope_sees_columns_inside_hybrid_search() -> None:
     real ``exp.Expression`` children rather than, say, a pre-rendered clause string.
     """
     scope = build_scope(_parse(HYBRID_SEARCH))
+    assert scope is not None
 
     assert sorted(c.name for c in scope.columns) == [
         "embedding",

@@ -253,7 +253,9 @@ def test_only_a_named_parameter_survives_the_migration_bindable(
     """
     out = to_milvus(postgres_sql, read="postgres")
     assert out == milvus_sql
-    placeholder = assert_is_real_milvus(out, exp.Select).find(exp.Placeholder)
+    ast = assert_is_real_milvus(out, exp.Select)
+    placeholder = ast.find(exp.Placeholder)
+    assert placeholder is not None
     assert bool(placeholder.this) is bindable
 
 

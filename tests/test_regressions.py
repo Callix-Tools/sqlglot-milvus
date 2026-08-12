@@ -99,7 +99,10 @@ def _clauses(select: exp.Select) -> dict:
     return {key: repr(value) for key, value in select.args.items() if value}
 
 
-def assert_stable(sql: str, node_type: type[exp.Expression]) -> exp.Expression:
+def assert_stable(
+    sql: str,
+    node_type: type[exp.Expression] | tuple[type[exp.Expression], ...],
+) -> exp.Expression:
     """The D12 four-property contract, reused for the MilvusQL statements this file exercises."""
     ast = parse(sql)
     assert not isinstance(ast, exp.Command), (
@@ -831,7 +834,9 @@ def test_clause_order_strictness_covers_offset() -> None:
     ``_validate_clause_order`` compares against ``earliest_limit``/``latest_limit`` across both
     "limit" and "offset" keys, so writing SEARCH PARAMS between them is rejected like every other
     D5 violation instead of being silently reordered on the way out."""
-    non_canonical = "SELECT id FROM items LIMIT 10 SEARCH PARAMS (ef=1) OFFSET 5"
+    non_canonical = (
+        "SELECT id FROM items LIMIT 10 SEARCH PARAMS (ef=1) OFFSET 5"
+    )
     canonical = "SELECT id FROM items LIMIT 10 OFFSET 5 SEARCH PARAMS (ef=1)"
     with pytest.raises(ParseError, match="SEARCH PARAMS must follow LIMIT"):
         parse(non_canonical)

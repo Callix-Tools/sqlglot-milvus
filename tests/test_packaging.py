@@ -31,7 +31,16 @@ from sqlglot.parsers.base import BaseParser
 from sqlglot.tokens import TokenType
 
 import sqlglot_milvus
-from sqlglot_milvus import _tokens, expressions
+from sqlglot_milvus import expressions
+from sqlglot_milvus._tokens import (
+    EXPECTED_TOKEN_TYPE_COUNT,
+    TT_CONSISTENCY_LEVEL,
+    TT_HYBRID_SEARCH,
+    TT_INNER_PRODUCT,
+    TT_L1,
+    TT_RELEASE,
+    TT_SEARCH_PARAMS,
+)
 from sqlglot_milvus.dialect import Milvus
 from sqlglot_milvus.expressions import HYBRID_ARG, SEARCH_PARAMS_ARG
 
@@ -171,17 +180,28 @@ PINNED_HOSTS = {
     "TT_HYBRID_SEARCH": "LANGUAGE",
     "TT_SEARCH_PARAMS": "PROPERTIES",
     "TT_RELEASE": "SOUNDS_LIKE",
+    "TT_CONSISTENCY_LEVEL": "ORDERED",
 }
 
-#: What `_tokens` currently binds. Every assertion below reads this, not `PINNED_HOSTS`.
-LIVE_HOSTS = {alias: getattr(_tokens, alias) for alias in PINNED_HOSTS}
+#: What `_tokens` currently binds. Every assertion below reads this, not `PINNED_HOSTS`. Bound
+#: names, not `getattr(module, alias)`: importing each symbol directly means a rename upstream
+#: fails at collection time with an ImportError naming the missing symbol, rather than inside an
+#: assertion.
+LIVE_HOSTS = {
+    "TT_INNER_PRODUCT": TT_INNER_PRODUCT,
+    "TT_L1": TT_L1,
+    "TT_HYBRID_SEARCH": TT_HYBRID_SEARCH,
+    "TT_SEARCH_PARAMS": TT_SEARCH_PARAMS,
+    "TT_RELEASE": TT_RELEASE,
+    "TT_CONSISTENCY_LEVEL": TT_CONSISTENCY_LEVEL,
+}
 
 
 def test_token_type_member_count_is_pinned() -> None:
     actual = len(list(TokenType))
-    assert actual == _tokens.EXPECTED_TOKEN_TYPE_COUNT, (
+    assert actual == EXPECTED_TOKEN_TYPE_COUNT, (
         f"sqlglot {sqlglot.__version__} exposes {actual} TokenType members; this dialect was "
-        f"written against {_tokens.EXPECTED_TOKEN_TYPE_COUNT}. TokenType is a plain Enum and "
+        f"written against {EXPECTED_TOKEN_TYPE_COUNT}. TokenType is a plain Enum and "
         "cannot be extended, so MilvusQL recycles members that sqlglot itself never references "
         "(_tokens.py). A different member count means the enum was edited upstream: before "
         "bumping EXPECTED_TOKEN_TYPE_COUNT, re-verify by grep that every recycled host "

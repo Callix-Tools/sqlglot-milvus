@@ -581,7 +581,9 @@ def test_hybrid_search(sql) -> None:
 def test_search_params_before_offset_is_rejected() -> None:
     # SEARCH PARAMS must follow the whole LIMIT/OFFSET family, not just LIMIT: canonical order is
     # "search_params_after_limit_offset" above (LIMIT ... OFFSET ... SEARCH PARAMS).
-    with pytest.raises(sqlglot.ParseError, match="SEARCH PARAMS must follow LIMIT"):
+    with pytest.raises(
+        sqlglot.ParseError, match="SEARCH PARAMS must follow LIMIT"
+    ):
         sqlglot.parse_one(
             "SELECT id FROM items LIMIT 10 SEARCH PARAMS (ef_search=64) OFFSET 5",
             read="milvus",
