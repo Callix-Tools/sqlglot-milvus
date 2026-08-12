@@ -55,9 +55,6 @@ The entity is called `TABLE`, not `COLLECTION`. On the SQL surface that is the o
 so `CREATE TABLE` / `DROP TABLE` parse for free; "collection" remains the term one level down, in
 the `pymilvus` calls the AST is translated into.
 
-Full grammar, including the constructs above, canonical clause ordering and every documented
-tradeoff, is in [`docs/MILVUSQL_SPEC.md`](docs/MILVUSQL_SPEC.md).
-
 `ADD FIELD` and `RENAME TO` are the only supported `ALTER TABLE` actions. Milvus cannot change a
 field's type, change a vector's dimension or drop a field, so `DROP`/`ALTER COLUMN ... TYPE`/
 `MODIFY` are rejected with a `ParseError` explaining that the collection needs recreating — never
@@ -161,10 +158,18 @@ caller) must always pass `dialect="milvus"` explicitly when calling `.sql()`.
 
 ## Development
 
+Dependencies are managed as [`uv` dependency groups](pyproject.toml)
+(`lint`, `test`), and day-to-day commands run through
+[go-task](https://taskfile.dev) (`taskfile.dist.yaml`):
+
 ```bash
-uv venv && uv pip install -e '.[dev]'
-pytest
+task install   # uv sync --all-groups
+task lint      # ruff format + ruff check + bandit + ty
+task tests     # pytest (COVERAGE=true for a coverage report)
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same two commands on every PR and
+on push to `main`.
 
 ## License
 

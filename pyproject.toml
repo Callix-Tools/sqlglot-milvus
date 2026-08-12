@@ -3,7 +3,8 @@ name = "sqlglot-milvus"
 version = "0.1.0"
 description = "MilvusQL: a SQL dialect for Milvus, as a sqlglot plugin"
 readme = { file = "README.md", content-type = "text/markdown" }
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Neko1313", email = "nikita.ribalchencko@yandex.ru" }
 ]
@@ -12,12 +13,22 @@ keywords = ["sqlglot", "milvus", "sql", "dialect", "vector-search", "pgvector"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: SQL",
     "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 
 dependencies = ["sqlglot>=30.16.0,<31"]
+
+[project.urls]
+Homepage = "https://github.com/Callix-Tools/sqlglot-milvus"
+Repository = "https://github.com/Callix-Tools/sqlglot-milvus"
+Issues = "https://github.com/Callix-Tools/sqlglot-milvus/issues"
 
 [build-system]
 requires = ["uv_build>=0.9.18,<0.12.0"]
@@ -26,9 +37,6 @@ build-backend = "uv_build"
 
 [project.entry-points."sqlglot.dialects"]
 milvus = "sqlglot_milvus.dialect:Milvus"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/sqlglot_milvus"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
