@@ -1168,19 +1168,41 @@ def test_partial_index_predicate_should_round_trip() -> None:
     assert_stable("CREATE INDEX i ON items (a) WHERE a > 1", exp.Create)
 
 
-def test_index_include_degrades_to_a_command() -> None:
-    """FINDING 8. The D6 branch fires on any `(` after the table name and then only understands
-    USING/WITH/WHERE, so INCLUDE -- which stock sqlglot parses fine -- falls off the end and the
-    whole statement degrades to an opaque exp.Command."""
+def test_index_include_no_longer_degrades_to_a_command() -> None:
+    """FINDING 8 (fixed). The D6 branch used to fire on any `(` after the table name and then
+    only understand USING/WITH/WHERE, so INCLUDE -- which stock sqlglot parses fine -- fell off
+    the end and the whole statement degraded to an opaque exp.Command. The branch now parses
+    every trailing clause the base grammar knows (INCLUDE, PARTITION BY, USING INDEX TABLESPACE,
+    a trailing ON), so nothing is left unconsumed and CREATE INDEX keeps its real structure."""
     sql = "CREATE INDEX i ON items (a) INCLUDE (b)"
     assert isinstance(parse(sql, dialect=None), exp.Create)
-    assert isinstance(sqlglot.parse_one(sql, read="milvus"), exp.Command)
+    ast = sqlglot.parse_one(sql, read="milvus")
+    assert not isinstance(ast, exp.Command)
+    assert isinstance(ast, exp.Create)
+    include = ast.find(exp.IndexParameters).args.get("include")
+    assert [c.name for c in include] == ["b"]
+
+
+def test_index_include_is_dropped_but_no_longer_silently() -> None:
+    """Same treatment FINDING 7 already gets for WHERE: MilvusQL has no INCLUDE syntax to render
+    the columns back into, so the loss stands, but it is now reported under
+    unsupported_level=RAISE instead of happening in silence -- see
+    test_pgvector_index_include_is_reported_rather_than_dropped for the postgres-transpile path
+    this mirrors."""
+    ast = parse("CREATE INDEX i ON items (a) INCLUDE (b)")
+    assert ast.sql("milvus") == "CREATE INDEX i ON items (a)"
+    with pytest.raises(UnsupportedError, match="do not support INCLUDE"):
+        ast.sql("milvus", unsupported_level=ErrorLevel.RAISE)
 
 
 @pytest.mark.xfail(
-    strict=True, reason="FINDING 8: the D6 branch does not handle INCLUDE"
+    strict=True,
+    reason="FINDING 8: MilvusQL has no INCLUDE syntax, so indexparameters_sql still drops "
+    "IndexParameters.include -- it is now parsed and reported as unsupported instead of "
+    "silently degrading the whole statement to a Command, but the text still cannot round-trip "
+    "until the language grows an INCLUDE clause of its own.",
 )
-def test_index_include_should_parse() -> None:
+def test_index_include_should_round_trip() -> None:
     assert_stable("CREATE INDEX i ON items (a) INCLUDE (b)", exp.Create)
 
 

@@ -417,6 +417,50 @@ class Milvus(Dialect):
             )
 
         # ---------------------------------------------------------------
+        # Alias guard
+        # ---------------------------------------------------------------
+
+        #: The three multi-word keywords are tokenized as one token each
+        #: (see the Tokenizer.KEYWORDS pair registration above), so a
+        #: matched token's ``.text`` is two words joined by a space --
+        #: something no MilvusQL identifier can ever spell (the escape
+        #: hatch is quoting, which lexes each word as its own token and
+        #: never produces one of these three token types). None of the
+        #: three are in ``ID_VAR_TOKENS``/``ALIAS_TOKENS``, so they are
+        #: only ever reachable through the ``any_token=True`` catch-all
+        #: every "accept literally anything here" call site uses --
+        #: explicit alias (``AS x``), implicit table alias, and
+        #: everywhere else ``_parse_id_var`` is asked to be permissive.
+        #: Left unguarded, ``AS search params`` parses: ``_parse_alias``
+        #: matches ``AS`` and ``_parse_id_var(any_token=True, ...)``
+        #: happily takes the merged token's raw text, producing
+        #: ``Identifier("SEARCH PARAMS")`` that regenerates as ``AS
+        #: SEARCH PARAMS`` -- a merged keyword masquerading as a
+        #: one-word alias, invisible to every other check because it is
+        #: a stable round-trip. ``SELECT a AS search`` still works:
+        #: ``search`` alone tokenizes as an ordinary identifier, this
+        #: only fires once the tokenizer has already merged two adjacent
+        #: words into one of these three tokens.
+        _MULTIWORD_KEYWORD_TOKENS: t.ClassVar = {
+            TT_HYBRID_SEARCH,
+            TT_SEARCH_PARAMS,
+            TT_CONSISTENCY_LEVEL,
+        }
+
+        def _parse_id_var(
+            self,
+            any_token: bool = True,
+            tokens: t.Collection[TokenType] | None = None,
+        ) -> exp.Expr | None:
+            if (
+                any_token
+                and self._curr
+                and self._curr.token_type in self._MULTIWORD_KEYWORD_TOKENS
+            ):
+                return None
+            return super()._parse_id_var(any_token=any_token, tokens=tokens)
+
+        # ---------------------------------------------------------------
         # Search clauses
         # ---------------------------------------------------------------
 
@@ -507,6 +551,24 @@ class Milvus(Dialect):
 
             Supporting both costs one branch and makes ``postgres ->
             milvus`` index transpilation work without any rewriting.
+
+            FINDING 8: this branch used to stop after ``WHERE``, so any
+            trailing clause the base grammar knows about but MilvusQL
+            has no syntax for (``INCLUDE``, ``PARTITION BY``, ``USING
+            INDEX TABLESPACE``, a trailing ``ON``) was left unconsumed.
+            An unconsumed suffix is not a parse error at this level --
+            it just makes the *statement* fail to fully parse, and
+            ``CREATE INDEX`` falls back whole to an opaque ``exp.Command``
+            that round-trips byte-identical while carrying no structure
+            at all (``find_all`` sees nothing). That is a strictly worse
+            outcome than the one ``WHERE`` already gets: parsed into a
+            real ``IndexParameters`` node and reported as unsupported at
+            generation time (see ``indexparameters_sql``), not silently
+            dropped. Parsing the same trailing clauses the base grammar
+            supports -- in the base parser's own order -- gets every one
+            of them the same honest treatment as ``WHERE``, instead of
+            three different failure modes depending on which clause a
+            caller happens to write.
             """
             if not self._match(TokenType.L_PAREN, advance=False):
                 return super()._parse_index_params()
@@ -521,17 +583,33 @@ class Milvus(Dialect):
                     # method at all and regenerated as if USING had
                     # never been typed.
                     self.raise_error("USING expects an index method")
+            include = (
+                self._parse_wrapped_id_vars()
+                if self._match_text_seq("INCLUDE")
+                else None
+            )
+            partition_by = self._parse_partition_by()
             with_storage = (
                 self._match(TokenType.WITH)
                 and self._parse_wrapped_properties()
             )
+            tablespace = (
+                self._parse_var(any_token=True)
+                if self._match_text_seq("USING", "INDEX", "TABLESPACE")
+                else None
+            )
             where = self._parse_where()
+            on = self._parse_field() if self._match(TokenType.ON) else None
             return self.expression(
                 exp.IndexParameters(
                     using=using,
                     columns=columns,
+                    include=include,
+                    partition_by=partition_by,
                     with_storage=with_storage,
+                    tablespace=tablespace,
                     where=where,
+                    on=on,
                 )
             )
 

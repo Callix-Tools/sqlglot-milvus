@@ -678,23 +678,26 @@ def test_the_bare_words_remain_ordinary_identifiers(sql) -> None:
     assert_accepted(sql, exp.Select)
 
 
-def test_known_defect_multiword_keyword_fabricates_a_spaced_identifier() -> (
-    None
-):
-    """KNOWN DEFECT: ``AS search params`` yields ``Identifier("SEARCH PARAMS")``.
+def test_multiword_keyword_in_alias_position_is_rejected() -> None:
+    """Was a KNOWN DEFECT: ``AS search params`` used to yield ``Identifier("SEARCH PARAMS")``.
 
-    In explicit-alias position the parser takes any token, so it accepts the merged keyword token
-    and stores its *text* -- uppercased, with an embedded space, matching neither word the user
-    typed. The statement is then regenerated as ``... AS SEARCH PARAMS``, which round-trips
-    stably and is therefore invisible to every other check.
+    In explicit-alias position the parser used to take any token, so it accepted the merged
+    keyword token and stored its *text* -- uppercased, with an embedded space, matching neither
+    word the user typed. The statement then regenerated as ``... AS SEARCH PARAMS``, which
+    round-tripped stably and was therefore invisible to every other check.
 
-    Correct behaviour is to reject this: ``AS`` must be followed by exactly one identifier, and a
-    merged multi-word keyword is not one. Pinned as-is because it is a two-word alias in a language
-    with no two-word identifiers -- a quietly wrong AST, exactly what this file exists to prevent.
+    Fixed by teaching ``_parse_id_var`` to refuse the three merged multi-word keyword tokens
+    whenever it is asked to accept *any* token (``any_token=True``) -- the only way they were
+    ever reachable, since none of the three is in ``ID_VAR_TOKENS``/``ALIAS_TOKENS``. The alias
+    slot is then left empty, so the parser tries to read ``search params`` as its own clause
+    (``SEARCH PARAMS`` needs a following ``(...)``) and fails loudly instead of fabricating a
+    two-word identifier no MilvusQL identifier can ever spell.
     """
-    ast = parse("SELECT * FROM t AS search params")
-    assert ast.args["from_"].this.alias == "SEARCH PARAMS"
-    assert ast.sql(dialect="milvus") == "SELECT * FROM t AS SEARCH PARAMS"
+    assert_rejected(
+        "SELECT * FROM t AS search params",
+        "Expecting (",
+        highlight="search params",
+    )
 
 
 # --------------------------------------------------------------------------------------------
