@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-08-13
+### Bug Fixes
+
+- fix: two silent-degradation parser defects (CREATE INDEX INCLUDE, AS <keyword> alias) by @Neko1313 in [#1](https://github.com/Callix-Tools/sqlglot-milvus/pull/1)
+
+
+### New Contributors
+
+- @Neko1313 made their first contribution in [#1](https://github.com/Callix-Tools/sqlglot-milvus/pull/1)
+
+
+
+**Full Changelog**: https://github.com/Callix-Tools/sqlglot-milvus/compare/v0.1.0...v0.1.1
 ## [0.1.0] - 2026-08-12
 ### Miscellaneous
 
@@ -15,6 +28,7 @@ All notable changes to this project will be documented in this file.
 
 ### New Contributors
 
+- @github-actions[bot] made their first contribution
 - @ made their first contribution
 
 
